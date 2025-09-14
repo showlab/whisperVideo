@@ -1,0 +1,80 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+*.log
+*.tmp
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+.cache/
+.coverage*
+htmlcov/
+
+# ---- Environments ----
+.env
+.env.*
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Build & Dist ----
+build/
+dist/
+site/
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db
+
+# ---- Node/Frontend ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+sam2/demo/frontend/dist/
+sam2/demo/frontend/.cache/
+sam2/demo/frontend/node_modules/
+
+# ---- Models & Checkpoints ----
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.pb
+*.tflite
+*.bin
+*.model
+pretrain_TalkSet.model
+model/faceDetector/s3fd/sfd_face.pth
+checkpoints/
+runs/
+outputs/
+
+# ---- Data & Generated ----
+data/
+TalkSet/lists/lists_out/
+
+# ---- Media (often large) ----
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.flac
+*.mp3
+*.aac
+sam2/demo/frontend/src/assets/videos/
+sam2/sav_dataset/example/
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
