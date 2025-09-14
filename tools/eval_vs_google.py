@@ -51,6 +51,24 @@ def to_annotation(segs):
     return ann
 
 
+def load_refined_segments(ep_root):
+    refined_p = os.path.join(ep_root, 'result', 'refined_diriazation.pckl')
+    if not os.path.isfile(refined_p):
+        raise FileNotFoundError(f"Missing refined output: {refined_p}")
+    items = pickle.load(open(refined_p, 'rb'))
+    out = []
+    for s in items:
+        st = float(s.get('start', 0.0))
+        en = float(s.get('end', 0.0))
+        lab = s.get('speaker')
+        if lab is None:
+            lab = 'UNK'
+        lab = str(lab)
+        if en > st:
+            out.append((st, en, lab))
+    return out
+
+
 def overlap(a, b):
     return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
 
@@ -156,23 +174,10 @@ def turn_change_f1(ref, pred, tol=0.5):
     return prec, rec, f1
 
 
-def eval_episode(ep_root):
-    base_pkl = os.path.join(ep_root, 'result', 'baseline_whisperx', 'segments.pkl')
-    g_csv = os.path.join(ep_root, 'result', 'google_stt', 'segments.csv')
-    if not (os.path.isfile(base_pkl) and os.path.isfile(g_csv)):
-        raise FileNotFoundError('Missing baseline or google files')
-
-    pred = load_baseline_segments(base_pkl)
-    ref = load_google_csv(g_csv)
+def eval_single(ref, pred):
     mapping, ref_labels, pred_labels = greedy_mapping(ref, pred)
-
-    # Frame-level agreement (proxy for 1-DER, with collar, no overlap modeling)
     fra = frame_level_agreement(ref, pred, mapping, step=0.01, collar=0.25)
-
-    # Turn-change F1
     prec, rec, f1 = turn_change_f1(ref, pred, tol=0.5)
-
-    # DER via pyannote (if available)
     der_skip = der_with = None
     if HAVE_PYANNOTE:
         ann_ref = to_annotation(ref)
@@ -182,7 +187,6 @@ def eval_episode(ep_root):
         metric_with = DiarizationErrorRate(collar=0.25, skip_overlap=False)
         der_skip = metric_skip(ann_ref, ann_hyp)
         der_with = metric_with(ann_ref, ann_hyp)
-
     return {
         'frame_agreement': fra,
         'turn_precision': prec,
@@ -196,25 +200,92 @@ def eval_episode(ep_root):
     }
 
 
+def eval_episode(ep_root, compare='both'):
+    base_pkl = os.path.join(ep_root, 'result', 'baseline_whisperx', 'segments.pkl')
+    g_csv = os.path.join(ep_root, 'result', 'google_stt', 'segments.csv')
+    if not os.path.isfile(g_csv):
+        raise FileNotFoundError('Missing google files')
+    ref = load_google_csv(g_csv)
+
+    out = {}
+    if compare in ('baseline', 'both'):
+        if not os.path.isfile(base_pkl):
+            raise FileNotFoundError('Missing baseline segments.pkl')
+        pred_b = load_baseline_segments(base_pkl)
+        out['baseline'] = eval_single(ref, pred_b)
+    if compare in ('refined', 'both'):
+        try:
+            pred_r = load_refined_segments(ep_root)
+            out['refined'] = eval_single(ref, pred_r)
+        except FileNotFoundError:
+            pass
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--episode', type=str, required=True,
-                    help='Episode root, e.g., multi_human_talking_dataset/fallowshow/1')
+    ap.add_argument('--episode', type=str, help='Episode root, e.g., multi_human_talking_dataset/fallowshow/1')
+    ap.add_argument('--dataset_root', type=str, help='If set, evaluate all episodes under this root that have google_stt/segments.csv')
+    ap.add_argument('--compare', type=str, choices=['baseline','refined','both'], default='both')
     args = ap.parse_args()
-    res = eval_episode(args.episode)
 
-    print(f"Episode: {args.episode}")
-    print(f"Frame-level agreement (proxy 1-DER, collar=0.25): {res['frame_agreement']:.3f}")
-    print(f"Turn-change F1 (tol=0.5s): P={res['turn_precision']:.3f} R={res['turn_recall']:.3f} F1={res['turn_f1']:.3f}")
-    if res['der_skip_overlap'] is not None:
-        print(f"DER (skip overlap): {res['der_skip_overlap']:.3f}")
-        print(f"DER (with overlap): {res['der_with_overlap']:.3f}")
+    episodes = []
+    if args.dataset_root:
+        for show in sorted(os.listdir(args.dataset_root)):
+            show_dir = os.path.join(args.dataset_root, show)
+            if not os.path.isdir(show_dir):
+                continue
+            for ep in sorted(os.listdir(show_dir)):
+                ep_dir = os.path.join(show_dir, ep)
+                if not os.path.isdir(ep_dir):
+                    continue
+                g_csv = os.path.join(ep_dir, 'result', 'google_stt', 'segments.csv')
+                if os.path.isfile(g_csv):
+                    episodes.append(ep_dir)
+    elif args.episode:
+        episodes = [args.episode]
     else:
-        print("pyannote.metrics not available: DER not computed.")
-    print(f"Speakers: ref={res['ref_speakers']} pred={res['pred_speakers']}")
-    print(f"Mapping (pred→ref): {res['mapping']}")
+        print('Provide --episode or --dataset_root')
+        sys.exit(1)
+
+    # Accumulators
+    sums = {'baseline': defaultdict(float), 'refined': defaultdict(float)}
+    counts = {'baseline': 0, 'refined': 0}
+
+    for ep in episodes:
+        try:
+            res = eval_episode(ep, compare=args.compare)
+        except Exception as e:
+            print(f"ERROR {ep}: {e}")
+            continue
+        print(f"Episode: {ep}")
+        for label in ('baseline','refined'):
+            if label not in res:
+                continue
+            r = res[label]
+            print(f"  [{label}] Frame-agree: {r['frame_agreement']:.3f} | Turn-F1: {r['turn_f1']:.3f} (P={r['turn_precision']:.3f}, R={r['turn_recall']:.3f})")
+            if r['der_skip_overlap'] is not None:
+                print(f"  [{label}] DER skip/with overlap: {r['der_skip_overlap']:.3f}/{r['der_with_overlap']:.3f}")
+            sums[label]['frame_agreement'] += r['frame_agreement']
+            sums[label]['turn_precision'] += r['turn_precision']
+            sums[label]['turn_recall'] += r['turn_recall']
+            sums[label]['turn_f1'] += r['turn_f1']
+            if r['der_skip_overlap'] is not None:
+                sums[label]['der_skip_overlap'] += r['der_skip_overlap']
+                sums[label]['der_with_overlap'] += r['der_with_overlap']
+            counts[label] += 1
+
+    # Macro averages
+    for label in ('baseline','refined'):
+        n = counts[label]
+        if n == 0:
+            continue
+        print(f"\nMacro-avg over {n} episodes [{label}] :")
+        print(f"  Frame-agree: {sums[label]['frame_agreement']/n:.3f}")
+        print(f"  Turn-F1: {sums[label]['turn_f1']/n:.3f} (P={sums[label]['turn_precision']/n:.3f}, R={sums[label]['turn_recall']/n:.3f})")
+        if 'der_skip_overlap' in sums[label]:
+            print(f"  DER skip/with overlap: {sums[label]['der_skip_overlap']/n:.3f}/{sums[label]['der_with_overlap']/n:.3f}")
 
 
 if __name__ == '__main__':
     main()
-

@@ -114,7 +114,7 @@ def episode_id_from_path(ep_path: str) -> Tuple[str, str, str]:
 def recognize_with_gcs(gcs_uri: str, language_code: str, min_speakers: int, max_speakers: int,
                         model: str, enhanced: bool):
     try:
-        from google.cloud import speech_v1p1beta1 as speech
+        from google.cloud import speech
     except Exception as e:
         raise RuntimeError(f"google-cloud-speech is not installed or unavailable: {e}")
 
@@ -144,7 +144,7 @@ def recognize_with_gcs(gcs_uri: str, language_code: str, min_speakers: int, max_
 def recognize_with_content(local_path: str, language_code: str, min_speakers: int, max_speakers: int,
                            model: str, enhanced: bool, encoding_override: str = None):
     try:
-        from google.cloud import speech_v1p1beta1 as speech
+        from google.cloud import speech
     except Exception as e:
         raise RuntimeError(f"google-cloud-speech is not installed or unavailable: {e}")
 
