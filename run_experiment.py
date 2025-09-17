@@ -156,17 +156,7 @@ def process_episode(episode_root, n_threads=4):
         else:
             raise RuntimeError("tracks.pckl size does not match crop/*.avi count and no cropFile present")
 
-    # Identity assignment (facenet-based, baseline behavior)
-    id_tracks_p = os.path.join(result_dir, 'tracks_identity.pckl')
-    log("identity assignment")
-    if os.path.exists(id_tracks_p):
-        annotated_tracks = _load_pickle(id_tracks_p)
-    else:
-        verifier = IdentityVerifier()
-        annotated_tracks = verifier.annotate_identities(vidTracks)
-        _save_pickle(annotated_tracks, id_tracks_p)
-
-    # Active Speaker Detection scores
+    # Active Speaker Detection scores (compute before identities for ASD-gated embeddings)
     log("prepare/load ASD scores")
     scores_p = _prepare_scores(result_dir)
     if scores_p and os.path.exists(scores_p):
@@ -180,17 +170,52 @@ def process_episode(episode_root, n_threads=4):
         scores_p = os.path.join(result_dir, 'scores.pckl')
         _save_pickle(scores, scores_p)
 
-    # WhisperX transcription + alignment + diarization (constrained by visual speaker count)
-    # Estimate speakers from visual identities (ID_*) with small slack
+    # Identity assignment: cluster face tracks into stable visual identities (auto-K, constraints) with ASD gating
+    id_tracks_p = os.path.join(result_dir, 'tracks_identity.pckl')
+    log("identity assignment (visual constrained clustering)")
+    if os.path.exists(id_tracks_p):
+        annotated_tracks = _load_pickle(id_tracks_p)
+    else:
+        try:
+            from .identity_cluster import cluster_visual_identities
+        except Exception:
+            from identity_cluster import cluster_visual_identities  # when run from whisperv/ cwd
+        annotated_tracks = cluster_visual_identities(vidTracks, scores_list=scores)
+        _save_pickle(annotated_tracks, id_tracks_p)
+
+    # WhisperX transcription + alignment + diarization (constrained by speaker count)
+    # Estimate speakers from two modalities, then take the smaller:
+    #  - Visual identities (VID_*) count across all tracks
+    #  - Audio-visual active identities: VID_* identities that have any ASD-positive frames
     vis_ids = set()
     for tr in annotated_tracks:
         ident = tr.get('identity')
-        if isinstance(ident, str) and ident.startswith('ID_'):
+        if isinstance(ident, str) and ident.startswith('VID_'):
             vis_ids.add(ident)
-    K = max(1, len(vis_ids))
-    min_spk = max(1, K - 1)
-    max_spk = max(K + 1, 2)
-    log(f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} (K={K})")
+    K_vis = max(1, len(vis_ids))
+
+    # Compute number of speaking identities from ASD scores
+    active_ids = set()
+    for i, tr in enumerate(annotated_tracks):
+        ident = tr.get('identity')
+        if not (isinstance(ident, str) and ident.startswith('VID_')):
+            continue
+        if i >= len(scores):
+            continue
+        sc = scores[i]
+        if sc is None or len(sc) == 0:
+            continue
+        # Mark identity active if any frame in this track has positive ASD score
+        if any((s_val > 0) for s_val in sc):
+            active_ids.add(ident)
+    K_asd = len(active_ids) if active_ids else K_vis
+
+    # Choose smaller K across modalities, then set diarization range
+    K = max(1, min(K_vis, K_asd))
+    # Policy: min = 1, max = K
+    min_spk = 1
+    max_spk = K
+    log(f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} (K={K}, K_vis={K_vis}, K_asd={K_asd})")
     raw_diar_p = os.path.join(result_dir, 'raw_diriazation_constrained.pckl')
     if os.path.exists(raw_diar_p):
         raw_segments = _load_pickle(raw_diar_p)
@@ -238,6 +263,14 @@ def process_episode(episode_root, n_threads=4):
 
 
 def find_episodes(dataset_root):
+    """Discover episodes under dataset_root.
+    Supports both full-root (root -> show -> episode) and single-episode path.
+    """
+    # Single-episode directory: contains expected subfolders like 'avi' and 'result'
+    if os.path.isdir(os.path.join(dataset_root, 'avi')) and os.path.isdir(os.path.join(dataset_root, 'result')):
+        return [dataset_root]
+
+    # Show/episode tree
     shows = []
     for d in sorted(os.listdir(dataset_root)):
         show_dir = os.path.join(dataset_root, d)
@@ -247,7 +280,7 @@ def find_episodes(dataset_root):
     for show in shows:
         for e in sorted(os.listdir(show)):
             ep_dir = os.path.join(show, e)
-            if os.path.isdir(ep_dir):
+            if os.path.isdir(ep_dir) and os.path.isdir(os.path.join(ep_dir, 'avi')) and os.path.isdir(os.path.join(ep_dir, 'result')):
                 episodes.append(ep_dir)
     return episodes
 

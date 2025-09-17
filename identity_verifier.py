@@ -52,17 +52,29 @@ class IdentityVerifier:
         except Exception:
             return None
 
-    def get_key_frames(self, track_file):
+    def get_key_frames(self, track_file, frame_indices=None, max_samples: int = 15):
         cap = cv2.VideoCapture(track_file)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total_frames <= 0:
             cap.release()
             return []
 
-        positions = [0, total_frames // 4, total_frames // 2, (3 * total_frames) // 4, max(0, total_frames - 1)]
+        # Determine sampling positions
+        if frame_indices is not None and len(frame_indices) > 0:
+            # Clamp and unique-sort
+            idx = sorted(set(int(min(max(0, i), total_frames - 1)) for i in frame_indices))
+            if len(idx) > max_samples:
+                # Uniformly sample up to max_samples from active indices
+                step = max(1, len(idx) // max_samples)
+                idx = idx[::step][:max_samples]
+            positions = idx
+        else:
+            # Default: 5 spread-out positions across the clip
+            positions = [0, total_frames // 4, total_frames // 2, (3 * total_frames) // 4, max(0, total_frames - 1)]
+
         tensors = []
         for pos in positions:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
             ret, frame = cap.read()
             if ret:
                 tensor = self.preprocess_frame(frame)
@@ -80,8 +92,8 @@ class IdentityVerifier:
         embeds = F.normalize(embeds, p=2, dim=1)
         return embeds
 
-    def _track_embedding(self, track_file):
-        tensors = self.get_key_frames(track_file)
+    def _track_embedding(self, track_file, active_indices=None):
+        tensors = self.get_key_frames(track_file, frame_indices=active_indices)
         if not tensors:
             return None
         # Batch through the network

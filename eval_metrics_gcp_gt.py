@@ -159,6 +159,64 @@ def acc_ppc_rpc(ref_segs: List[Dict], sys_mapped: List[Dict]) -> Tuple[float, fl
     return acc, ppc, rpc
 
 
+def acc_ppc_rpc_hyp(ref_segs: List[Dict], sys_mapped: List[Dict]) -> Tuple[float, float, float]:
+    """Hypothesis-anchored (system-anchored) metrics over system segments that overlap GT.
+    - For each system segment, if it overlaps any reference speech, assign a GT label
+      by maximum time-overlap with reference; else drop segment.
+    - Compute Acc over these system segments.
+    - Compute per-character precision/recall and average across reference labels.
+    """
+    # Index reference by label → list of spans
+    ref_by_lab = segments_to_tracks(ref_segs)
+    ref_labels: List[str] = sorted(ref_by_lab.keys())
+
+    # Helper: GT label for a system segment by max overlap
+    def gt_label_for_sys(seg: Dict) -> Optional[str]:
+        s = float(seg['start']); e = float(seg['end'])
+        best_lab = None; best_ov = 0.0
+        for L, spans in ref_by_lab.items():
+            # total overlap with this label's spans
+            ov = 0.0
+            for a, b in spans:
+                if b <= s or a >= e:
+                    continue
+                ov += overlap((a, b), (s, e))
+            if ov > best_ov:
+                best_ov = ov; best_lab = L
+        return best_lab if best_ov > 0.0 else None
+
+    # Build samples: (y_true, y_pred) over sys segments with overlap
+    y_true: List[str] = []
+    y_pred: List[str] = []
+    for seg in sys_mapped:
+        gt = gt_label_for_sys(seg)
+        if gt is None:
+            continue  # ignore sys segment with no GT overlap
+        y_true.append(gt)
+        y_pred.append(str(seg['speaker']))
+
+    if not y_true:
+        return 0.0, 0.0, 0.0
+
+    # Accuracy over sys segments
+    acc = float(sum(1 for t, p in zip(y_true, y_pred) if t == p)) / max(1, len(y_true))
+
+    # Per-character precision/recall across reference labels
+    precisions = []
+    recalls = []
+    for c in ref_labels:
+        tp = sum(1 for t, p in zip(y_true, y_pred) if t == c and p == c)
+        fp = sum(1 for t, p in zip(y_true, y_pred) if t != c and p == c)
+        fn = sum(1 for t, p in zip(y_true, y_pred) if t == c and p != c)
+        prec = tp / max(1, tp + fp)
+        rec = tp / max(1, tp + fn)
+        precisions.append(prec)
+        recalls.append(rec)
+    ppc = float(np.mean(precisions)) if precisions else 0.0
+    rpc = float(np.mean(recalls)) if recalls else 0.0
+    return acc, ppc, rpc
+
+
 def der_with_pyannote(ref_segs: List[Dict], sys_mapped: List[Dict], collar: float, skip_overlap: bool) -> float:
     # Build pyannote.core Annotation for ref and sys
     try:
@@ -341,7 +399,9 @@ def main():
         sys_mapped = label_segments_by_mapping(sys_segs, mapping)
 
         # Acc/Ppc/Rpc over reference segments
-        acc, ppc, rpc = acc_ppc_rpc(ref_segs, sys_mapped)
+        acc_ref, ppc_ref, rpc_ref = acc_ppc_rpc(ref_segs, sys_mapped)
+        # Hypothesis-anchored variants over system segments
+        acc_hyp, ppc_hyp, rpc_hyp = acc_ppc_rpc_hyp(ref_segs, sys_mapped)
         # Frame-level accuracy (FLA)
         fla = frame_level_accuracy(ref_segs, sys_mapped)
         # Turn-change F1
@@ -361,9 +421,12 @@ def main():
         per_ep.append({
             'show': ep.show,
             'episode': ep.episode,
-            'acc': acc,
-            'ppc': ppc,
-            'rpc': rpc,
+            'acc': acc_ref,
+            'ppc': ppc_ref,
+            'rpc': rpc_ref,
+            'acc_hyp': acc_hyp,
+            'ppc_hyp': ppc_hyp,
+            'rpc_hyp': rpc_hyp,
             'fla': fla,
             'turn_f1': f1_tc,
             'turn_p': p_tc,
@@ -371,7 +434,7 @@ def main():
             'der_o': der_o,
             'der': der_w,
         })
-        print(f"[EVAL] {ep.show}/{ep.episode}: Acc={acc:.3f} Ppc={ppc:.3f} Rpc={rpc:.3f} FLA={fla:.3f} TC-F1={f1_tc:.3f} (P={p_tc:.3f}, R={r_tc:.3f}) DER(O)={der_o if der_o is not None else 'NA'} DER={der_w if der_w is not None else 'NA'}")
+        print(f"[EVAL] {ep.show}/{ep.episode}: Acc(ref)={acc_ref:.3f} Ppc(ref)={ppc_ref:.3f} Rpc(ref)={rpc_ref:.3f} | Acc(hyp)={acc_hyp:.3f} Ppc(hyp)={ppc_hyp:.3f} Rpc(hyp)={rpc_hyp:.3f} | FLA={fla:.3f} TC-F1={f1_tc:.3f} (P={p_tc:.3f}, R={r_tc:.3f}) DER(O)={der_o if der_o is not None else 'NA'} DER={der_w if der_w is not None else 'NA'}")
 
     # Aggregate by show and overall (macro average per episode)
     from collections import defaultdict
@@ -389,13 +452,16 @@ def main():
         acc = avg([r['acc'] for r in rows])
         ppc = avg([r['ppc'] for r in rows])
         rpc = avg([r['rpc'] for r in rows])
+        acc_h = avg([r['acc_hyp'] for r in rows])
+        ppc_h = avg([r['ppc_hyp'] for r in rows])
+        rpc_h = avg([r['rpc_hyp'] for r in rows])
         fla = avg([r['fla'] for r in rows])
         f1tc = avg([r['turn_f1'] for r in rows])
         ptc = avg([r['turn_p'] for r in rows])
         rtc = avg([r['turn_r'] for r in rows])
         der_o = avg([r['der_o'] for r in rows])
         der_w = avg([r['der'] for r in rows])
-        print(f"  {key}: Acc={acc:.3f} Ppc={ppc:.3f} Rpc={rpc:.3f} FLA={fla:.3f} TC-F1={f1tc:.3f} (P={ptc:.3f}, R={rtc:.3f}) DER(O)={'NA' if der_o is None else f'{der_o:.3f}'} DER={'NA' if der_w is None else f'{der_w:.3f}'}")
+        print(f"  {key}: Acc(ref)={acc:.3f} Ppc(ref)={ppc:.3f} Rpc(ref)={rpc:.3f} | Acc(hyp)={acc_h:.3f} Ppc(hyp)={ppc_h:.3f} Rpc(hyp)={rpc_h:.3f} | FLA={fla:.3f} TC-F1={f1tc:.3f} (P={ptc:.3f}, R={rtc:.3f}) DER(O)={'NA' if der_o is None else f'{der_o:.3f}'} DER={'NA' if der_w is None else f'{der_w:.3f}'}")
 
 
 if __name__ == '__main__':
