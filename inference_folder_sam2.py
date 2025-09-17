@@ -322,14 +322,16 @@ def visualization(tracks, scores, args):
     fw = firstImage.shape[1]
     fh = firstImage.shape[0]
     vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw,fh))
-    colorDict = {0: 0, 1: 255}
+    # Fixed overlay colors per spec (BGR): green=#92d051, red=#db3a3c
+    GREEN_BGR = (81, 208, 146)
+    RED_BGR = (60, 58, 219)
     for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
         image = cv2.imread(fname)
         for face in faces[fidx]:
-            clr = colorDict[int((face['score'] >= 0))]
+            color = GREEN_BGR if face['score'] >= 0 else RED_BGR
             txt = round(face['score'], 1)
-            cv2.rectangle(image, (int(face['x']-face['s']), int(face['y']-face['s'])), (int(face['x']+face['s']), int(face['y']+face['s'])),(0,clr,255-clr),10)
-            cv2.putText(image,'%s'%(txt), (int(face['x']-face['s']), int(face['y']-face['s'])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,clr,255-clr),5)
+            cv2.rectangle(image, (int(face['x']-face['s']), int(face['y']-face['s'])), (int(face['x']+face['s']), int(face['y']+face['s'])), color, 10)
+            cv2.putText(image,'%s'%(txt), (int(face['x']-face['s']), int(face['y']-face['s'])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 5)
         vOut.write(image)
     vOut.release()
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
@@ -509,13 +511,15 @@ def visualization(tracks, scores, diarization_results, args):
     fw = firstImage.shape[1]
     fh = firstImage.shape[0]
     vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw, fh), True)
-    colorDict = {0: 0, 1: 255}
+    # Fixed overlay colors per spec (BGR): green=#92d051, red=#db3a3c
+    GREEN_BGR = (81, 208, 146)
+    RED_BGR = (60, 58, 219)
 
     for fidx, fname in tqdm.tqdm(enumerate(flist), total=len(flist)):
         image = cv2.imread(fname)
 
         for face in faces[fidx]:
-            clr = colorDict[int((face['score'] >= 0))]
+            color = GREEN_BGR if face['score'] >= 0 else RED_BGR
             txt = f"{face['identity']}: {round(face['score'], 1)}"  # Format as "ID_1: 2.5"
             bbox_x = int(face['x'] - face['s'])
             bbox_y = int(face['y'] - face['s'])
@@ -526,12 +530,12 @@ def visualization(tracks, scores, diarization_results, args):
             cv2.rectangle(image,
                           (bbox_x, bbox_y),
                           (int(face['x'] + face['s']), int(face['y'] + face['s'])),
-                          (0, clr, 255 - clr), 5)
+                          color, 5)
 
             # Smaller font for ID and score on the same line
             cv2.putText(image, txt,
                         (bbox_x, bbox_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (0, clr, 255 - clr), 3)
+                        color, 3)
 
         vOut.write(image)
 

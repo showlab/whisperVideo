@@ -152,23 +152,48 @@ def process_episode_whisperx(episode_root: str, device: str = "cuda", batch_size
 
 
 def find_episodes(dataset_root: str):
+    """Discover episodes robustly from a root that may be:
+    - the dataset root containing show folders
+    - a single show folder containing multiple episode folders
+    - a single episode folder containing an `avi/` with `audio.wav`
+
+    An episode is any directory that directly contains `avi/audio.wav`.
+    """
+    def has_avi_dir(p: str) -> bool:
+        return os.path.isdir(os.path.join(p, 'avi')) and os.path.isfile(os.path.join(p, 'avi', 'audio.wav'))
+
+    root = dataset_root
+
+    # Case 1: dataset_root is already an episode dir
+    if has_avi_dir(root):
+        return [root]
+
+    # Case 2: dataset_root is a show dir (its children are episodes)
+    lvl1 = [p for p in sorted(glob.glob(os.path.join(root, '*'))) if os.path.isdir(p)]
+    lvl1_episodes = [p for p in lvl1 if has_avi_dir(p)]
+    if lvl1_episodes:
+        return sorted(lvl1_episodes)
+
+    # Case 3: dataset_root is the dataset dir (children are shows; grandchildren are episodes)
     episodes = []
-    for show in sorted(glob.glob(os.path.join(dataset_root, '*'))):
-        if not os.path.isdir(show):
-            continue
-        for ep in sorted(glob.glob(os.path.join(show, '*'))):
-            if os.path.isdir(ep):
+    for show in lvl1:
+        lvl2 = [p for p in sorted(glob.glob(os.path.join(show, '*'))) if os.path.isdir(p)]
+        for ep in lvl2:
+            if has_avi_dir(ep):
                 episodes.append(ep)
-    return episodes
+    return sorted(episodes)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run WhisperX baseline (audio-only) on all episodes.")
+    parser = argparse.ArgumentParser(description="Run WhisperX baseline (audio-only) on episodes.")
     parser.add_argument(
         "--dataset_root",
         type=str,
         default="/workspace/siyuan/siyuan/whisperv_proj/multi_human_talking_dataset",
-        help="Root directory containing show folders",
+        help=(
+            "Root path which can be: dataset root (contains show folders), "
+            "a single show folder (contains episode folders), or a single episode folder (contains avi/)."
+        ),
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=16)

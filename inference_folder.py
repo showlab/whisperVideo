@@ -1,6 +1,9 @@
 import sys, time, os, tqdm, torch, argparse, glob, subprocess, warnings, cv2, pickle, numpy, pdb, math, python_speech_features
 from collections import defaultdict, Counter
 
+# Ensure TF backend is disabled for transformers to avoid protobuf/TensorFlow issues
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import whisperx
 import gc
 
@@ -244,14 +247,16 @@ def visualization(tracks, scores, args):
     fw = firstImage.shape[1]
     fh = firstImage.shape[0]
     vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw,fh))
-    colorDict = {0: 0, 1: 255}
+    # Use specified brand colors (OpenCV expects BGR)
+    GREEN_BGR = (81, 208, 146)  # #92d051
+    RED_BGR = (60, 58, 219)     # #db3a3c
     for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
         image = cv2.imread(fname)
         for face in faces[fidx]:
-            clr = colorDict[int((face['score'] >= 0))]
+            color = GREEN_BGR if face['score'] >= 0 else RED_BGR
             txt = round(face['score'], 1)
-            cv2.rectangle(image, (int(face['x']-face['s']), int(face['y']-face['s'])), (int(face['x']+face['s']), int(face['y']+face['s'])),(0,clr,255-clr),10)
-            cv2.putText(image,'%s'%(txt), (int(face['x']-face['s']), int(face['y']-face['s'])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0,clr,255-clr),5)
+            cv2.rectangle(image, (int(face['x']-face['s']), int(face['y']-face['s'])), (int(face['x']+face['s']), int(face['y']+face['s'])), color, 10)
+            cv2.putText(image,'%s'%(txt), (int(face['x']-face['s']), int(face['y']-face['s'])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color,5)
         vOut.write(image)
     vOut.release()
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
@@ -296,7 +301,7 @@ def _to_diarize_df(diarize_segments):
     raise TypeError(f"Unsupported diarization type: {type(diarize_segments)}")
 
 
-def speech_diarization():
+def speech_diarization(min_speakers: int = None, max_speakers: int = None):
     # device = "cpu"
     device = "cuda"
     audio_file = os.path.join(args.pyaviPath, "audio.wav")
@@ -326,14 +331,31 @@ def speech_diarization():
     try:
         diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
         try:
-            diarize_segments = diarize_model(audio)
+            if min_speakers is not None or max_speakers is not None:
+                diarize_segments = diarize_model(
+                    audio,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                )
+            else:
+                diarize_segments = diarize_model(audio)
         except Exception:
-            diarize_segments = diarize_model(audio_file)
+            if min_speakers is not None or max_speakers is not None:
+                diarize_segments = diarize_model(
+                    audio_file,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                )
+            else:
+                diarize_segments = diarize_model(audio_file)
     except AttributeError:
         # Fallback for older WhisperX versions
         from pyannote.audio import Pipeline
         diarize_model = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=hf_token)
-        diarize_segments = diarize_model(audio_file)
+        if min_speakers is not None or max_speakers is not None:
+            diarize_segments = diarize_model(audio_file, min_speakers=min_speakers, max_speakers=max_speakers)
+        else:
+            diarize_segments = diarize_model(audio_file)
     # diarize_model(audio, min_speakers=min_speakers, max_speakers=max_speakers)
 
     # Assign speakers to words/segments via whisperx using a normalized DataFrame
@@ -543,6 +565,161 @@ def refine_diarization_with_visual(annotated_tracks, scores, raw_segments, fps=2
             merged.append(cur.copy())
     return merged
 
+def refine_diarization_boundaries(raw_segments, pad=0.05, gap_split=0.25, min_seg=0.15, merge_gap=0.10, close_gap=0.12):
+    """Refine WhisperX diarization boundaries using aligned words.
+    - Snap segment to min/max word times with small padding
+    - Split segments at long internal silences (> gap_split)
+    - Drop/absorb very short slivers (< min_seg)
+    - Merge adjacent same-speaker segments with small gaps (< merge_gap)
+    Returns list of dicts with keys: start, end, speaker, text
+    """
+    # Enforce a harder minimum to avoid over-fragmentation after snapping/splitting
+    # Use at least twice min_seg and not smaller than ~0.5s (close to common collars)
+    min_seg_hard = max(min_seg * 2.0, 0.5)
+    refined = []
+
+    for seg in raw_segments:
+        s = float(seg.get('start', seg.get('start_time', 0.0)))
+        e = float(seg.get('end', seg.get('end_time', s)))
+        if e <= s:
+            continue
+        spk = seg.get('speaker', None)
+        text = seg.get('text', '')
+        words = seg.get('words', []) or []
+        # Extract valid words
+        ws = []
+        for w in words:
+            try:
+                ws.append((float(w.get('start', 0.0)), float(w.get('end', 0.0))))
+            except Exception:
+                continue
+        ws = [(ws_, we_) for ws_, we_ in ws if we_ > ws_]
+        ws.sort()
+        if not ws:
+            # No words: keep original segment
+            refined.append({'start': s, 'end': e, 'speaker': spk, 'text': text})
+            continue
+
+        # Snap to word bounds with padding
+        ws0 = min(t0 for t0, _ in ws)
+        weN = max(t1 for _, t1 in ws)
+        snapped_start = max(s, ws0 - pad)
+        snapped_end = min(e, weN + pad)
+        if snapped_end <= snapped_start:
+            continue
+
+        # Split on long internal silences between words
+        splits = [snapped_start]
+        prev_end = ws[0][1]
+        for t0, t1 in ws[1:]:
+            gap = t0 - prev_end
+            if gap > gap_split:
+                # split at midpoint of gap
+                cut = prev_end + gap / 2.0
+                # only split if both sides remain reasonably long
+                if (cut - splits[-1]) >= min_seg_hard and (snapped_end - cut) >= min_seg_hard:
+                    splits.append(cut)
+            prev_end = t1
+        splits.append(snapped_end)
+
+        # Create sub-segments per split range
+        prev_a = splits[0]
+        groups = []
+        for b in splits[1:]:
+            a = prev_a
+            prev_a = b
+            if (b - a) < min_seg_hard:
+                # too short; accumulate by merging later
+                groups.append((a, b))
+            else:
+                groups.append((a, b))
+
+        # Merge tiny slivers into neighbors
+        merged_groups = []
+        for g in groups:
+            if not merged_groups:
+                merged_groups.append(g)
+                continue
+            a, b = g
+            if (b - a) < min_seg_hard:
+                # absorb into previous
+                pa, pb = merged_groups[-1]
+                merged_groups[-1] = (pa, max(pb, b))
+            else:
+                merged_groups.append((a, b))
+
+        for a, b in merged_groups:
+            if b - a >= min_seg_hard:
+                refined.append({'start': a, 'end': b, 'speaker': spk, 'text': text})
+
+    # Merge adjacent same-speaker segments with small gaps
+    if not refined:
+        return []
+    refined.sort(key=lambda x: (x['start'], x['end']))
+    out = [refined[0].copy()]
+    for cur in refined[1:]:
+        prev = out[-1]
+        if cur['speaker'] == prev['speaker'] and (cur['start'] - prev['end']) <= merge_gap:
+            prev['end'] = max(prev['end'], cur['end'])
+        else:
+            out.append(cur.copy())
+
+    # Overlap trimming and gap snapping across different-speaker boundaries
+    if len(out) <= 1:
+        return out
+    trimmed = [out[0].copy()]
+    for i in range(1, len(out)):
+        prev = trimmed[-1]
+        cur = out[i].copy()
+        if prev['speaker'] != cur['speaker']:
+            # Overlap case
+            if prev['end'] > cur['start']:
+                cut = 0.5 * (prev['end'] + cur['start'])
+                # Ensure resulting segments are not too short
+                # Adjust cut if needed to respect min_seg from segment endpoints
+                lo = max(prev['start'] + min_seg_hard * 0.5, cur['start'])
+                hi = min(prev['end'], cur['end'] - min_seg_hard * 0.5)
+                cut = min(max(cut, lo), hi)
+                # Apply cut
+                prev_end_new = max(prev['start'], cut)
+                cur_start_new = min(cur['end'], cut)
+                # Only keep if durations are valid
+                if (prev_end_new - prev['start']) >= min_seg_hard:
+                    prev['end'] = prev_end_new
+                # else: keep prev as-is (will likely be < min_seg; handled by next check)
+                if (cur['end'] - cur_start_new) >= min_seg_hard:
+                    cur['start'] = cur_start_new
+            else:
+                # Tiny gap snapping
+                gap = cur['start'] - prev['end']
+                if gap <= close_gap:
+                    mid = 0.5 * (prev['end'] + cur['start'])
+                    prev['end'] = mid
+                    cur['start'] = mid
+
+            # Drop segments that became too short
+            if (prev['end'] - prev['start']) < min_seg_hard:
+                # Remove prev by merging its time into current start if overlapping
+                if prev['end'] > cur['start']:
+                    cur['start'] = min(cur['start'], prev['end'])
+                trimmed[-1] = cur
+                continue
+            if (cur['end'] - cur['start']) < min_seg_hard:
+                # Skip current segment
+                trimmed[-1] = prev
+                continue
+            trimmed[-1] = prev
+            trimmed.append(cur)
+        else:
+            # Same speaker adjacency: merge if close
+            if cur['start'] - prev['end'] <= merge_gap:
+                prev['end'] = max(prev['end'], cur['end'])
+                trimmed[-1] = prev
+            else:
+                trimmed.append(cur)
+
+    return trimmed
+
 def seconds_to_srt_time(seconds):
     """Convert seconds to SRT time format."""
     td = timedelta(seconds=seconds)
@@ -614,13 +791,15 @@ def visualization(tracks, scores, diarization_results, args):
     fw = firstImage.shape[1]
     fh = firstImage.shape[0]
     vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw, fh), True)
-    colorDict = {0: 0, 1: 255}
+    # Fixed overlay colors per spec (BGR): green=#92d051, red=#db3a3c
+    GREEN_BGR = (81, 208, 146)
+    RED_BGR = (60, 58, 219)
 
     for fidx, fname in tqdm.tqdm(enumerate(flist), total=len(flist)):
         image = cv2.imread(fname)
 
         for face in faces[fidx]:
-            clr = colorDict[int((face['score'] >= 0))]
+            color = GREEN_BGR if face['score'] >= 0 else RED_BGR
             txt = f"{face['identity']}: {round(face['score'], 1)}"  # Format as "ID_1: 2.5"
             bbox_x = int(face['x'] - face['s'])
             bbox_y = int(face['y'] - face['s'])
@@ -631,12 +810,12 @@ def visualization(tracks, scores, diarization_results, args):
             cv2.rectangle(image,
                           (bbox_x, bbox_y),
                           (int(face['x'] + face['s']), int(face['y'] + face['s'])),
-                          (0, clr, 255 - clr), 5)
+                          color, 5)
 
             # Smaller font for ID and score on the same line
             cv2.putText(image, txt,
                         (bbox_x, bbox_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        (0, clr, 255 - clr), 3)
+                        color, 3)
 
         vOut.write(image)
 

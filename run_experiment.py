@@ -156,7 +156,7 @@ def process_episode(episode_root, n_threads=4):
         else:
             raise RuntimeError("tracks.pckl size does not match crop/*.avi count and no cropFile present")
 
-    # Identity assignment
+    # Identity assignment (facenet-based, baseline behavior)
     id_tracks_p = os.path.join(result_dir, 'tracks_identity.pckl')
     log("identity assignment")
     if os.path.exists(id_tracks_p):
@@ -180,14 +180,23 @@ def process_episode(episode_root, n_threads=4):
         scores_p = os.path.join(result_dir, 'scores.pckl')
         _save_pickle(scores, scores_p)
 
-    # WhisperX transcription + alignment + diarization
-    log("whisperx transcription+alignment+diarization")
-    raw_diar_p = os.path.join(result_dir, 'raw_diriazation.pckl')
+    # WhisperX transcription + alignment + diarization (constrained by visual speaker count)
+    # Estimate speakers from visual identities (ID_*) with small slack
+    vis_ids = set()
+    for tr in annotated_tracks:
+        ident = tr.get('identity')
+        if isinstance(ident, str) and ident.startswith('ID_'):
+            vis_ids.add(ident)
+    K = max(1, len(vis_ids))
+    min_spk = max(1, K - 1)
+    max_spk = max(K + 1, 2)
+    log(f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} (K={K})")
+    raw_diar_p = os.path.join(result_dir, 'raw_diriazation_constrained.pckl')
     if os.path.exists(raw_diar_p):
         raw_segments = _load_pickle(raw_diar_p)
         raw_results = {"segments": raw_segments}
     else:
-        raw_results = inf.speech_diarization()
+        raw_results = inf.speech_diarization(min_speakers=min_spk, max_speakers=max_spk)
         _save_pickle(raw_results["segments"], raw_diar_p)
 
     # Match speakers to visual identities and correct
@@ -212,6 +221,17 @@ def process_episode(episode_root, n_threads=4):
             annotated_tracks, scores, raw_results["segments"], fps=25, tau=0.3, min_seg=0.08, merge_gap=0.2
         )
         _save_pickle(refined_segments, refined_p)
+
+    # ASR-aligned boundary snapping refinement (DER-oriented)
+    log("refining diarization by ASR-aligned boundary snapping")
+    refined_asr_p = os.path.join(result_dir, 'refined_diriazation_asr.pckl')
+    if os.path.exists(refined_asr_p):
+        refined_asr_segments = _load_pickle(refined_asr_p)
+    else:
+        refined_asr_segments = inf.refine_diarization_boundaries(
+            raw_results["segments"], pad=0.05, gap_split=0.25, min_seg=0.15, merge_gap=0.10
+        )
+        _save_pickle(refined_asr_segments, refined_asr_p)
 
     # Visualization and SRT subtitle generation (disabled by request)
     log("skip visualization + SRT generation")

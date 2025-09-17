@@ -68,6 +68,23 @@ def load_refined_segments(ep_root):
             out.append((st, en, lab))
     return out
 
+def load_refined_asr_segments(ep_root):
+    refined_p = os.path.join(ep_root, 'result', 'refined_diriazation_asr.pckl')
+    if not os.path.isfile(refined_p):
+        raise FileNotFoundError(f"Missing refined ASR output: {refined_p}")
+    items = pickle.load(open(refined_p, 'rb'))
+    out = []
+    for s in items:
+        st = float(s.get('start', 0.0))
+        en = float(s.get('end', 0.0))
+        lab = s.get('speaker')
+        if lab is None:
+            lab = 'UNK'
+        lab = str(lab)
+        if en > st:
+            out.append((st, en, lab))
+    return out
+
 
 def overlap(a, b):
     return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
@@ -219,6 +236,12 @@ def eval_episode(ep_root, compare='both'):
             out['refined'] = eval_single(ref, pred_r)
         except FileNotFoundError:
             pass
+    if compare in ('refined_asr', 'both', 'all'):
+        try:
+            pred_ra = load_refined_asr_segments(ep_root)
+            out['refined_asr'] = eval_single(ref, pred_ra)
+        except FileNotFoundError:
+            pass
     return out
 
 
@@ -226,7 +249,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--episode', type=str, help='Episode root, e.g., multi_human_talking_dataset/fallowshow/1')
     ap.add_argument('--dataset_root', type=str, help='If set, evaluate all episodes under this root that have google_stt/segments.csv')
-    ap.add_argument('--compare', type=str, choices=['baseline','refined','both'], default='both')
+    ap.add_argument('--compare', type=str, choices=['baseline','refined','refined_asr','both','all'], default='both')
     args = ap.parse_args()
 
     episodes = []
@@ -249,8 +272,12 @@ def main():
         sys.exit(1)
 
     # Accumulators
-    sums = {'baseline': defaultdict(float), 'refined': defaultdict(float)}
-    counts = {'baseline': 0, 'refined': 0}
+    sums = {
+        'baseline': defaultdict(float),
+        'refined': defaultdict(float),
+        'refined_asr': defaultdict(float),
+    }
+    counts = {'baseline': 0, 'refined': 0, 'refined_asr': 0}
 
     for ep in episodes:
         try:
@@ -259,7 +286,7 @@ def main():
             print(f"ERROR {ep}: {e}")
             continue
         print(f"Episode: {ep}")
-        for label in ('baseline','refined'):
+        for label in ('baseline','refined','refined_asr'):
             if label not in res:
                 continue
             r = res[label]
@@ -276,7 +303,7 @@ def main():
             counts[label] += 1
 
     # Macro averages
-    for label in ('baseline','refined'):
+    for label in ('baseline','refined','refined_asr'):
         n = counts[label]
         if n == 0:
             continue
