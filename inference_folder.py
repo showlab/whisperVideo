@@ -305,7 +305,7 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
     # device = "cpu"
     device = "cuda"
     audio_file = os.path.join(args.pyaviPath, "audio.wav")
-    batch_size = 16 # reduce if low on GPU mem
+    batch_size = 32 # reduce if low on GPU mem
     compute_type = "float16" # change to "int8" if low on GPU mem (may reduce accuracy)
     # compute_type = "int8" # change to "int8" if low on GPU mem (may reduce accuracy)
 

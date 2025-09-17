@@ -26,6 +26,91 @@ def read_rttm(path: str) -> List[Dict]:
     return segs
 
 
+def _merge_same_speaker(ref_segs: List[Dict], gap: float) -> List[Dict]:
+    """Merge adjacent segments of the same speaker when the gap <= `gap` seconds.
+    Keeps order stable; assumes ref_segs are lists of dicts with keys start/end/speaker (floats/str).
+    """
+    if gap is None or gap <= 0.0 or not ref_segs:
+        return ref_segs
+    ss = sorted(ref_segs, key=lambda x: (float(x['start']), float(x['end'])))
+    out: List[Dict] = []
+    cur = ss[0].copy()
+    for nxt in ss[1:]:
+        if str(nxt['speaker']) == str(cur['speaker']) and (float(nxt['start']) - float(cur['end'])) <= float(gap):
+            # merge by extending end
+            cur['end'] = max(float(cur['end']), float(nxt['end']))
+        else:
+            out.append(cur)
+            cur = nxt.copy()
+    out.append(cur)
+    return out
+
+
+def _absorb_tiny_same_speaker(ref_segs: List[Dict], min_seg: float) -> List[Dict]:
+    """Absorb very short segments (< min_seg) into adjacent same-speaker neighbor when possible.
+    Does not merge across speakers to avoid corrupting labels; if no same-speaker neighbor, keep as-is.
+    """
+    if min_seg is None or min_seg <= 0.0 or not ref_segs:
+        return ref_segs
+    segs = sorted(ref_segs, key=lambda x: (float(x['start']), float(x['end'])))
+    n = len(segs)
+    if n <= 1:
+        return segs
+    out: List[Dict] = []
+    i = 0
+    while i < n:
+        s = segs[i].copy()
+        dur = float(s['end']) - float(s['start'])
+        if dur >= min_seg:
+            out.append(s)
+            i += 1
+            continue
+        # try absorb into previous same-speaker
+        absorbed = False
+        if out and str(out[-1]['speaker']) == str(s['speaker']):
+            out[-1]['end'] = max(float(out[-1]['end']), float(s['end']))
+            absorbed = True
+        else:
+            # try absorb forward into next same-speaker
+            if i + 1 < n and str(segs[i + 1]['speaker']) == str(s['speaker']):
+                nxt = segs[i + 1].copy()
+                s_merged = {'start': float(min(float(s['start']), float(nxt['start']))),
+                            'end': float(max(float(s['end']), float(nxt['end']))),
+                            'speaker': str(s['speaker'])}
+                segs[i + 1] = s_merged
+                absorbed = True
+            else:
+                # no same-speaker neighbor to absorb; keep as-is
+                out.append(s)
+        i += 1 if not absorbed else 1
+    # ensure sorted and non-overlapping per speaker where possible
+    out.sort(key=lambda x: (float(x['start']), float(x['end'])))
+    return out
+
+
+def smooth_gt_segments(ref_segs: List[Dict], merge_gap: Optional[float], min_seg: Optional[float]) -> List[Dict]:
+    """Apply in-memory smoothing of GT segments:
+    1) Merge adjacent same-speaker segments separated by gap <= merge_gap
+    2) Absorb very short segments (< min_seg) into same-speaker neighbors when possible
+    Returns a new list of segments.
+    """
+    out = [
+        {
+            'start': float(s.get('start', 0.0)),
+            'end': float(s.get('end', 0.0)),
+            'speaker': str(s.get('speaker', 'UNK')),
+        }
+        for s in ref_segs
+        if float(s.get('end', 0.0)) > float(s.get('start', 0.0))
+    ]
+    if merge_gap is not None and merge_gap > 0.0:
+        out = _merge_same_speaker(out, merge_gap)
+    if min_seg is not None and min_seg > 0.0:
+        out = _absorb_tiny_same_speaker(out, min_seg)
+    return out
+
+
+
 def load_sys_segments(pickle_path: str) -> List[Dict]:
     import pickle
     with open(pickle_path, 'rb') as f:
@@ -377,6 +462,11 @@ def main():
     parser.add_argument('--collar', type=float, default=0.25)
     parser.add_argument('--skip_overlap', action='store_true', help='Report DER(O) by skipping overlap')
     parser.add_argument('--also_der_with_overlap', action='store_true', help='Also compute DER with overlap (in addition to DER(O))')
+    parser.add_argument('--gt_merge_gap', type=float, default=None,
+                        help='If set, merge adjacent GT segments of the same speaker when gap <= this (seconds)')
+    parser.add_argument('--gt_min_seg', type=float, default=None,
+                        help='If set, absorb GT segments shorter than this into same-speaker neighbors when possible')
+    # Removed advanced flip absorption options; keep only merge_gap/min_seg smoothing
     args = parser.parse_args()
 
     eps = find_episodes(args.dataset_root)
@@ -393,6 +483,10 @@ def main():
             print(f'[EVAL][SKIP] Missing system output: {pred}')
             continue
         ref_segs = read_rttm(rttm)
+        # Optional GT smoothing (in-memory only): same-speaker gap merge + tiny-segment absorb
+        if (args.gt_merge_gap is not None and args.gt_merge_gap > 0.0) or \
+           (args.gt_min_seg is not None and args.gt_min_seg > 0.0):
+            ref_segs = smooth_gt_segments(ref_segs, args.gt_merge_gap, args.gt_min_seg)
         sys_segs = load_sys_segments(pred)
         # Build global mapping and map system labels to ref label set
         mapping = build_global_mapping(sys_segs, ref_segs)

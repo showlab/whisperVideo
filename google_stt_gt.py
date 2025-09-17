@@ -56,8 +56,31 @@ def gather_words_from_response(response) -> List[WordInfo]:
             et = sec_from_duration(w.end_time)
             speaker = int(getattr(w, "speaker_tag", 0) or 0)
             words.append(WordInfo(word=w.word, start=st, end=et, speaker=speaker))
-    words.sort(key=lambda x: (x.start, x.end))
-    return words
+    if not words:
+        return words
+
+    dedup_order: List[Tuple[str, float, float]] = []
+    dedup_map: dict[Tuple[str, float, float], WordInfo] = {}
+
+    for info in words:
+        key = (info.word, info.start, info.end)
+        existing = dedup_map.get(key)
+        if existing is None:
+            dedup_map[key] = info
+            dedup_order.append(key)
+            continue
+
+        # Prefer diarized speaker tags (>0) over the placeholder 0.
+        if existing.speaker == 0 and info.speaker != 0:
+            dedup_map[key] = info
+        elif existing.speaker != 0 and info.speaker == 0:
+            continue
+        else:
+            dedup_map[key] = info
+
+    deduped_words = [dedup_map[key] for key in dedup_order]
+    deduped_words.sort(key=lambda x: (x.start, x.end))
+    return deduped_words
 
 
 def words_to_segments(words: List[WordInfo], max_gap: float = 0.5) -> List[dict]:

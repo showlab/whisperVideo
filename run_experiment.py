@@ -227,10 +227,20 @@ def process_episode(episode_root, n_threads=4):
         # Fallback to visual count if ASD has no positives
         K_used = K_vis
 
-    # 4) Apply diarization range policy: min=1, max=K_used
-    min_spk = 1
-    max_spk = K_used
-    log(f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} (K_used={K_used}, K_vis={K_vis}, speaking_ids={len(id_speaking)})")
+    # 4) Apply diarization range policy: keep identities with sufficient speaking evidence
+    diag_info = f"(K_used={K_used}, K_vis={K_vis}, speaking_ids={len(id_speaking)})"
+    if total_speaking > 0 and id_speaking:
+        min_active_frames = max(6, int(0.02 * total_speaking))  # ~0.24s or 2% of total speech frames
+        active_count = sum(1 for frames in id_speaking.values() if frames >= min_active_frames)
+    else:
+        min_active_frames = None
+        active_count = 0
+    min_spk = max(1, min(active_count, K_vis))
+    max_spk = max(K_used, min_spk)
+    log(
+        f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} "
+        f"{diag_info}, active_count={active_count}, min_active_frames={min_active_frames}"
+    )
     raw_diar_p = os.path.join(result_dir, 'raw_diriazation_constrained.pckl')
     if os.path.exists(raw_diar_p):
         raw_segments = _load_pickle(raw_diar_p)
@@ -328,15 +338,18 @@ def main():
         os.environ["HUGGINGFACE_TOKEN"] = args.hf_token
 
     # Distributed setup via torchrun (one process per GPU)
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     # Constrain each process to a single GPU and set default device
     if world_size > 1:
+        # Limit visible devices so that third-party libs default to the assigned GPU
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
+        print(f"[dist] local_rank={local_rank} CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
         # Defer torch import until after environment is set
         import torch
         if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
+            torch.cuda.set_device(0)
 
     dataset_root = args.dataset_root
     if not os.path.isdir(dataset_root):
