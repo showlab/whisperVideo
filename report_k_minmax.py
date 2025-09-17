@@ -159,18 +159,43 @@ def main():
                         scores = None
                 annotated = cluster_visual_identities(vidTracks, device=args.device, batch_size=args.batch_size,
                                                       scores_list=scores)
-                # Compute K from freshly annotated
-                fresh_ids = set()
-                for t in annotated:
-                    ident = t.get('identity')
-                    if isinstance(ident, str) and ident.startswith('VID_'):
-                        fresh_ids.add(ident)
+                # Compute K_used by speaking-time coverage (>=90%)
+                id_speaking = {}
+                total = 0
+                if scores is not None:
+                    for i, t in enumerate(annotated):
+                        ident = t.get('identity')
+                        if not (isinstance(ident, str) and ident.startswith('VID_')):
+                            continue
+                        if i >= len(scores):
+                            continue
+                        sc = scores[i]
+                        if not isinstance(sc, (list, tuple)) or len(sc) == 0:
+                            continue
+                        speak = sum(1 for v in sc if v > 0)
+                        if speak <= 0:
+                            continue
+                        id_speaking[ident] = id_speaking.get(ident, 0) + speak
+                        total += speak
+                # visual count fallback if no ASD
+                if total > 0 and id_speaking:
+                    items = sorted(id_speaking.items(), key=lambda x: x[1], reverse=True)
+                    cum = 0
+                    K_cov = 0
+                    for _, dur in items:
+                        cum += dur
+                        K_cov += 1
+                        if cum >= 0.90 * total:
+                            break
+                    K = max(1, K_cov)
+                else:
+                    fresh_ids = {t.get('identity') for t in annotated if isinstance(t.get('identity'), str) and t.get('identity').startswith('VID_')}
+                    K = max(1, len(fresh_ids))
                 if args.write:
                     load_pickle  # satisfy linter
                     import pickle
                     with open(ti, 'wb') as f:
                         pickle.dump(annotated, f)
-                K = len(fresh_ids)
                 min_spk, max_spk = derive_min_max(K)
                 print(f'{show},{ep},{K},{min_spk},{max_spk},recomputed')
                 if show in per_show:

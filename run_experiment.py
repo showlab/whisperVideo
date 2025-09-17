@@ -184,9 +184,8 @@ def process_episode(episode_root, n_threads=4):
         _save_pickle(annotated_tracks, id_tracks_p)
 
     # WhisperX transcription + alignment + diarization (constrained by speaker count)
-    # Estimate speakers from two modalities, then take the smaller:
-    #  - Visual identities (VID_*) count across all tracks
-    #  - Audio-visual active identities: VID_* identities that have any ASD-positive frames
+    # Data-driven K selection by speaking-time coverage:
+    # 1) Count visual identities (VID_*)
     vis_ids = set()
     for tr in annotated_tracks:
         ident = tr.get('identity')
@@ -194,8 +193,10 @@ def process_episode(episode_root, n_threads=4):
             vis_ids.add(ident)
     K_vis = max(1, len(vis_ids))
 
-    # Compute number of speaking identities from ASD scores
-    active_ids = set()
+    # 2) Compute per-identity speaking duration from ASD scores
+    # speaking frames per track: count of score > 0
+    id_speaking = {}
+    total_speaking = 0
     for i, tr in enumerate(annotated_tracks):
         ident = tr.get('identity')
         if not (isinstance(ident, str) and ident.startswith('VID_')):
@@ -203,19 +204,33 @@ def process_episode(episode_root, n_threads=4):
         if i >= len(scores):
             continue
         sc = scores[i]
-        if sc is None or len(sc) == 0:
+        if not isinstance(sc, (list, tuple)) or len(sc) == 0:
             continue
-        # Mark identity active if any frame in this track has positive ASD score
-        if any((s_val > 0) for s_val in sc):
-            active_ids.add(ident)
-    K_asd = len(active_ids) if active_ids else K_vis
+        speak_frames = sum(1 for v in sc if v > 0)
+        if speak_frames <= 0:
+            continue
+        id_speaking[ident] = id_speaking.get(ident, 0) + speak_frames
+        total_speaking += speak_frames
 
-    # Choose smaller K across modalities, then set diarization range
-    K = max(1, min(K_vis, K_asd))
-    # Policy: min = 1, max = K
+    # 3) Minimal K to cover >= 90% of speaking duration
+    if total_speaking > 0 and id_speaking:
+        items = sorted(id_speaking.items(), key=lambda x: x[1], reverse=True)
+        cum = 0
+        K_cov = 0
+        for _, dur in items:
+            cum += dur
+            K_cov += 1
+            if cum >= 0.90 * total_speaking:
+                break
+        K_used = max(1, K_cov)
+    else:
+        # Fallback to visual count if ASD has no positives
+        K_used = K_vis
+
+    # 4) Apply diarization range policy: min=1, max=K_used
     min_spk = 1
-    max_spk = K
-    log(f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} (K={K}, K_vis={K_vis}, K_asd={K_asd})")
+    max_spk = K_used
+    log(f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} (K_used={K_used}, K_vis={K_vis}, speaking_ids={len(id_speaking)})")
     raw_diar_p = os.path.join(result_dir, 'raw_diriazation_constrained.pckl')
     if os.path.exists(raw_diar_p):
         raw_segments = _load_pickle(raw_diar_p)
