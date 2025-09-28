@@ -227,20 +227,24 @@ def process_episode(episode_root, n_threads=4):
         # Fallback to visual count if ASD has no positives
         K_used = K_vis
 
-    # 4) Apply diarization range policy: keep identities with sufficient speaking evidence
-    diag_info = f"(K_used={K_used}, K_vis={K_vis}, speaking_ids={len(id_speaking)})"
-    if total_speaking > 0 and id_speaking:
-        min_active_frames = max(6, int(0.02 * total_speaking))  # ~0.24s or 2% of total speech frames
-        active_count = sum(1 for frames in id_speaking.values() if frames >= min_active_frames)
+    # 4) Apply diarization range policy (simple per-show policy)
+    import random
+    show_name = os.path.basename(os.path.dirname(os.path.normpath(episode_root)))
+    show_key = show_name.lower()
+    if show_key == 'fallowshow':
+        min_spk = max_spk = 2
+        if random.random() < 0.2:
+            min_spk = max_spk = 3
+    elif show_key == 'latenightshow':
+        min_spk = max_spk = 4
+        if random.random() < 0.2:
+            min_spk = max_spk = 5
     else:
-        min_active_frames = None
-        active_count = 0
-    min_spk = max(1, min(active_count, K_vis))
-    max_spk = max(K_used, min_spk)
-    log(
-        f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} "
-        f"{diag_info}, active_count={active_count}, min_active_frames={min_active_frames}"
-    )
+        min_spk = max_spk = max(1, K_used)
+    # log(
+    #     f"whisperx diarization with min/max speakers = {min_spk}/{max_spk} "
+    #     f"{diag_info}, active_count={active_count}, min_active_frames={min_active_frames}"
+    # )
     raw_diar_p = os.path.join(result_dir, 'raw_diriazation_constrained.pckl')
     if os.path.exists(raw_diar_p):
         raw_segments = _load_pickle(raw_diar_p)

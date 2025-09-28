@@ -29,8 +29,10 @@ warnings.filterwarnings("ignore")
 parser = argparse.ArgumentParser(description = "Demo")
 
 # parser.add_argument('--videoName',             type=str, default="001",   help='Demo video name')
-parser.add_argument('--videoFolder',           type=str, default="/home/aiassist/siyuan/video/Frasier",  help='Path for inputs, tmps and outputs')
-parser.add_argument('--pretrainModel',         type=str, default="/home/aiassist/siyuan/whisperV/inference_folder/pretrain_TalkSet.model",   help='Path for the pretrained TalkNet model')
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+parser.add_argument('--videoFolder',           type=str, default=os.path.join(_THIS_DIR, '..', 'multi_human_talking_dataset'),  help='Path for inputs, tmps and outputs')
+parser.add_argument('--episode_dir',           type=str, default=None, help='Episode directory; if set, overrides --videoFolder')
+parser.add_argument('--pretrainModel',         type=str, default=os.path.join(_THIS_DIR, 'pretrain_TalkSet.model'),   help='Path for the pretrained TalkNet model')
 
 parser.add_argument('--nDataLoaderThread',     type=int,   default=10,   help='Number of workers')
 parser.add_argument('--facedetScale',          type=float, default=0.25, help='Scale factor for face detection, the frames will be scale to 0.25 orig')
@@ -44,6 +46,11 @@ parser.add_argument('--duration',              type=int, default=0,  help='The d
 
 args, unknown  = parser.parse_known_args()
 
+# Allow --episode_dir to override videoFolder to match dataset usage
+USE_EPISODE = bool(getattr(args, 'episode_dir', None))
+if USE_EPISODE:
+    args.videoFolder = args.episode_dir
+
 if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
     Link = "1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea"
     cmd = "gdown --id %s -O %s"%(Link, args.pretrainModel)
@@ -51,10 +58,11 @@ if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
     
 from sam2.sam2.build_sam import build_sam2_video_predictor
 
-sam2_checkpoint = "/home/aiassist/siyuan/whisperV/inference_folder/sam2/checkpoints/sam2.1_hiera_small.pt"
-model_cfg = "/home/aiassist/siyuan/whisperV/inference_folder/sam2/sam2/configs/sam2.1/sam2.1_hiera_s.yaml"
+# Use repo-local SAM2 assets and Hydra config name (not absolute path)
+sam2_checkpoint = os.path.join(_THIS_DIR, 'sam2', 'checkpoints', 'sam2.1_hiera_small.pt')
+model_cfg = 'configs/sam2.1/sam2.1_hiera_s.yaml'
 
-predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, vos_optimized=True)
+predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, vos_optimized=False)
 
 def scene_detect(args):
     # CPU: Scene detection, output is the list of each shot's time duration
@@ -75,91 +83,111 @@ def scene_detect(args):
         sys.stderr.write('%s - scenes detected %d\n'%(args.videoFilePath, len(sceneList)))
     return sceneList
 
+
+def load_scene_or_detect(args):
+    scene_pkl = os.path.join(args.pyworkPath, 'scene.pckl')
+    if os.path.isfile(scene_pkl):
+        with open(scene_pkl, 'rb') as f:
+            return pickle.load(f)
+    return scene_detect(args)
+
+def _load_s3fd_faces_or_fail(args):
+    faces_pkl = os.path.join(args.pyworkPath, 'faces.pckl')
+    if not os.path.isfile(faces_pkl):
+        raise FileNotFoundError(f"Missing precomputed S3FD detections: {faces_pkl}. No fallback will be used.")
+    with open(faces_pkl, 'rb') as f:
+        return pickle.load(f)
+
+
 def inference_video(args, scene):
+    """Use precomputed S3FD detections as prompts per shot and propagate with SAM2.
+    Saves per-frame detections to faces_sam2.pckl in args.pyworkPath.
+    """
     torch.cuda.empty_cache()
-    # Initialize face detection model and SAM2 predictor
-    DET = S3FD(device='cuda')
     SAM2 = predictor
 
     flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg'))
     flist.sort()
-    dets = []
+    s3fd_faces = _load_s3fd_faces_or_fail(args)
 
-    for shot in scene:  # Process each shot
+    dets = []
+    base_shot_dir = os.path.join(args.pyworkPath, 'sam2_shots')
+    os.makedirs(base_shot_dir, exist_ok=True)
+
+    for shot in scene:
         shot_start, shot_end = shot[0].get_frames(), shot[1].get_frames()
         shot_frames = flist[shot_start:shot_end + 1]
 
-        # Save the frames of the shot into a temporary directory
-        shot_dir = os.path.join(args.pyworkPath, f'shot_{shot_start}_{shot_end}')
+        # Materialize shot frames into a temporary directory
+        shot_dir = os.path.join(base_shot_dir, f'shot_{shot_start}_{shot_end}')
         os.makedirs(shot_dir, exist_ok=True)
         for idx, frame_path in enumerate(shot_frames):
-            img = cv2.imread(frame_path)
-            cv2.imwrite(os.path.join(shot_dir, f'{idx}.jpg'), img)
+            dst = os.path.join(shot_dir, f'{idx}.jpg')
+            if not os.path.exists(dst):
+                try:
+                    os.symlink(os.path.abspath(frame_path), dst)
+                except Exception:
+                    img = cv2.imread(frame_path)
+                    cv2.imwrite(dst, img)
 
         # Initialize SAM2 with the shot frames
         inference_state = SAM2.init_state(video_path=shot_dir)
 
-        # Search for a frame with faces in the shot
+        # Find first frame in this shot with S3FD faces
         face_found = False
-        for frame_idx, frame_path in enumerate(shot_frames):
-            img = cv2.imread(frame_path)
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            # Detect faces using S3FD
-            bboxes = DET.detect_faces(img_rgb, conf_th=0.9, scales=[args.facedetScale])
-            # print(bboxes)
-            if len(bboxes) > 0:
+        bboxes = []
+        first_frame_idx = None
+        for rel_idx in range(len(shot_frames)):
+            global_idx = shot_start + rel_idx
+            frame_faces = s3fd_faces[global_idx] if global_idx < len(s3fd_faces) else []
+            if len(frame_faces) > 0:
                 face_found = True
-                first_frame_idx = frame_idx
-                first_frame_img_rgb = img_rgb
-                print(f"Faces detected in frame {first_frame_idx}")
+                first_frame_idx = rel_idx
+                bboxes = [ff['bbox'] for ff in frame_faces]
                 break
 
-        # If no faces found in the entire shot, skip to the next shot
         if not face_found:
-            print(f"No faces found in shot {shot_start}-{shot_end}, skipping this shot.")
+            for _ in range(shot_start, shot_end + 1):
+                dets.append([])
             continue
 
-        # Add each detected face as a box prompt to SAM2
+        # Add S3FD bboxes as prompts
         for ann_obj_id, bbox in enumerate(bboxes, start=1):
             box = np.array([bbox[0], bbox[1], bbox[2], bbox[3]], dtype=np.float32)
-            # Add the box as a prompt for SAM2
-            _, out_obj_ids, out_mask_logits = SAM2.add_new_points_or_box(
+            SAM2.add_new_points_or_box(
                 inference_state=inference_state,
-                frame_idx=first_frame_idx,  # Frame where the face was found
+                frame_idx=first_frame_idx,
                 obj_id=ann_obj_id,
                 box=box,
             )
-            print(f"Box prompt added for object {ann_obj_id} in frame {first_frame_idx}")
 
-        # Propagate segmentation across the remaining frames of the shot
+        # Propagate and convert masks to bboxes per frame
         video_segments = {}
         for out_frame_idx, out_obj_ids, out_mask_logits in SAM2.propagate_in_video(inference_state):
             video_segments[out_frame_idx] = {
                 out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
                 for i, out_obj_id in enumerate(out_obj_ids)
             }
-        print("Propagation finished")
 
-        # Collect detection results
         for fidx in range(shot_start, shot_end + 1):
             frame_dets = []
-            if fidx - shot_start in video_segments:
-                for obj_id, mask in video_segments[fidx - shot_start].items():
-                    # Extract bounding box from the mask (bounding box logic can vary)
-                    y_indices, x_indices = np.where(mask)
-                    if len(y_indices) > 0 and len(x_indices) > 0:
-                        x_min, x_max = x_indices.min(), x_indices.max()
-                        y_min, y_max = y_indices.min(), y_indices.max()
+            local_idx = fidx - shot_start
+            if local_idx in video_segments:
+                for obj_id, mask in video_segments[local_idx].items():
+                    mask = np.asarray(mask)
+                    if mask.ndim > 2:
+                        mask = np.squeeze(mask)
+                    y_idx, x_idx = np.where(mask)
+                    if len(y_idx) > 0 and len(x_idx) > 0:
+                        x_min, x_max = x_idx.min(), x_idx.max()
+                        y_min, y_max = y_idx.min(), y_idx.max()
                         bbox = [x_min, y_min, x_max, y_max]
-                        conf = 1.0  # Since we are using SAM2 propagation, confidence is assumed to be 1.0
-                        frame_dets.append({'frame': fidx, 'bbox': bbox, 'conf': conf})
-
+                        frame_dets.append({'frame': fidx, 'bbox': bbox, 'conf': 1.0})
             dets.append(frame_dets)
             sys.stderr.write('%s-%05d; %d dets\r' % (args.videoFilePath, fidx, len(frame_dets)))
 
-    # Save the results to a pickle file
-    savePath = os.path.join(args.pyworkPath, 'faces.pckl')
+    # Save as a separate file to avoid overwriting S3FD results
+    savePath = os.path.join(args.pyworkPath, 'faces_sam2.pckl')
     with open(savePath, 'wb') as fil:
         pickle.dump(dets, fil)
 
@@ -565,6 +593,35 @@ def visualization(tracks, scores, diarization_results, args):
     subprocess.call(command_without_subtitles, shell=True)
 
 def process_folder():
+    # Episode mode: use prepared assets and only generate faces_sam2.pckl then exit.
+    if USE_EPISODE:
+        args.savePath = args.episode_dir
+        args.pyaviPath = os.path.join(args.savePath, 'avi')
+        args.pyframesPath = os.path.join(args.savePath, 'frame')
+        args.pyworkPath = os.path.join(args.savePath, 'result')
+        args.pycropPath = os.path.join(args.savePath, 'crop')
+
+        # Validate structure
+        if not os.path.isdir(args.pyaviPath):
+            raise FileNotFoundError(f"Missing avi dir: {args.pyaviPath}")
+        if not os.path.isfile(os.path.join(args.pyaviPath, 'video.avi')):
+            raise FileNotFoundError(f"Missing video.avi in {args.pyaviPath}")
+        if not os.path.isfile(os.path.join(args.pyaviPath, 'audio.wav')):
+            raise FileNotFoundError(f"Missing audio.wav in {args.pyaviPath}")
+        if not os.path.isdir(args.pyframesPath):
+            raise FileNotFoundError(f"Missing frame dir: {args.pyframesPath}")
+        if not os.path.isdir(args.pyworkPath):
+            raise FileNotFoundError(f"Missing result dir: {args.pyworkPath}")
+
+        args.videoFilePath = os.path.join(args.pyaviPath, 'video.avi')
+        args.audioFilePath = os.path.join(args.pyaviPath, 'audio.wav')
+
+        scene = load_scene_or_detect(args)
+        inference_video(args, scene)
+        print(f"faces_sam2.pckl saved to: {os.path.join(args.pyworkPath, 'faces_sam2.pckl')}")
+        return
+
+    # Otherwise enumerate all files directly under videoFolder (legacy behavior)
     videoNames = [os.path.splitext(os.path.basename(v))[0] for v in glob.glob(os.path.join(args.videoFolder, '*.*'))]
     print(videoNames)
     for videoName in videoNames:
@@ -641,8 +698,8 @@ def process_video():
     scene = scene_detect(args)
     sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scene detection and save in %s \r\n" %(args.pyworkPath))    
 
-    # Face detection for the video frames
-    faces = inference_video(args)
+    # Face detection for the video frames (seed with S3FD, propagate with SAM2)
+    faces = inference_video(args, scene)
     sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(args.pyworkPath))
 
     # Face tracking

@@ -27,6 +27,11 @@ from scenedetect.detectors import ContentDetector
 from model.faceDetector.s3fd import S3FD
 from talkNet import talkNet
 from identity_verifier import IdentityVerifier
+try:
+    from identity_cluster import cluster_visual_identities
+except Exception:
+    # When run as module, fallback to relative import
+    from .identity_cluster import cluster_visual_identities
 
 warnings.filterwarnings("ignore")
 
@@ -144,7 +149,9 @@ def crop_video(args, track, cropFile):
     # CPU: crop the face clips
     flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg')) # Read the frames
     flist.sort()
-    vOut = cv2.VideoWriter(cropFile + 't.avi', cv2.VideoWriter_fourcc(*'XVID'), 25, (224,224))# Write video
+    if not hasattr(args, 'videoFps') or args.videoFps is None or args.videoFps <= 0:
+        raise RuntimeError("Missing or invalid args.videoFps; cannot crop face clips with correct timing.")
+    vOut = cv2.VideoWriter(cropFile + 't.avi', cv2.VideoWriter_fourcc(*'XVID'), float(args.videoFps), (224,224))# Write video
     dets = {'x':[], 'y':[], 's':[]}
     for det in track['bbox']: # Read the tracks
         dets['s'].append(max((det[3]-det[1]), (det[2]-det[0]))/2)
@@ -164,8 +171,8 @@ def crop_video(args, track, cropFile):
         face = frame[int(my-bs):int(my+bs*(1+2*cs)),int(mx-bs*(1+cs)):int(mx+bs*(1+cs))]
         vOut.write(cv2.resize(face, (224, 224)))
     audioTmp    = cropFile + '.wav'
-    audioStart  = (track['frame'][0]) / 25
-    audioEnd    = (track['frame'][-1]+1) / 25
+    audioStart  = (track['frame'][0]) / float(args.videoFps)
+    audioEnd    = (track['frame'][-1]+1) / float(args.videoFps)
     vOut.release()
     command = ("ffmpeg -y -i %s -c:a pcm_s16le -ac 1 -vn -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic" % \
               (args.audioFilePath, args.nDataLoaderThread, audioStart, audioEnd, audioTmp))
@@ -210,6 +217,8 @@ def evaluate_network(files, args):
                 break
         video.release()
         videoFeature = numpy.array(videoFeature)
+        # Keep TalkNet's expected 4:1 audio:video temporal ratio (100 Hz audio, 25 fps video)
+        # Use videoFeature frames count normalized by 25 to define the common length baseline.
         length = min((audioFeature.shape[0] - audioFeature.shape[0] % 4) / 100, videoFeature.shape[0] / 25)
         audioFeature = audioFeature[:int(round(length * 100)),:]
         videoFeature = videoFeature[:int(round(length * 25)),:,:]
@@ -246,7 +255,14 @@ def visualization(tracks, scores, args):
     firstImage = cv2.imread(flist[0])
     fw = firstImage.shape[1]
     fh = firstImage.shape[0]
-    vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw,fh))
+    if not hasattr(args, 'videoFps') or args.videoFps is None or args.videoFps <= 0:
+        raise RuntimeError("Missing or invalid args.videoFps; cannot render visualization with correct timing.")
+    vOut = cv2.VideoWriter(
+        os.path.join(args.pyaviPath, 'video_only.avi'),
+        cv2.VideoWriter_fourcc(*'XVID'),
+        float(args.videoFps),
+        (fw, fh)
+    )
     # Use specified brand colors (OpenCV expects BGR)
     GREEN_BGR = (81, 208, 146)  # #92d051
     RED_BGR = (60, 58, 219)     # #db3a3c
@@ -790,7 +806,15 @@ def visualization(tracks, scores, diarization_results, args):
     firstImage = cv2.imread(flist[0])
     fw = firstImage.shape[1]
     fh = firstImage.shape[0]
-    vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw, fh), True)
+    if not hasattr(args, 'videoFps') or args.videoFps is None or args.videoFps <= 0:
+        raise RuntimeError("Missing or invalid args.videoFps; cannot render visualization with correct timing.")
+    vOut = cv2.VideoWriter(
+        os.path.join(args.pyaviPath, 'video_only.avi'),
+        cv2.VideoWriter_fourcc(*'XVID'),
+        float(args.videoFps),
+        (fw, fh),
+        True,
+    )
     # Fixed overlay colors per spec (BGR): green=#92d051, red=#db3a3c
     GREEN_BGR = (81, 208, 146)
     RED_BGR = (60, 58, 219)
@@ -930,6 +954,37 @@ def process_video():
         subprocess.call(command, shell=True, stdout=None)
         sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the frames and save in %s \r\n" %(args.pyframesPath))
 
+    # Derive an effective FPS that aligns extracted frames with the audio timeline
+    def _compute_effective_fps(pyframes_dir: str, audio_wav_path: str, fallback_video_path: str) -> float:
+        flist_local = sorted(glob.glob(os.path.join(pyframes_dir, '*.jpg')))
+        n_frames_local = len(flist_local)
+        if n_frames_local <= 0:
+            raise RuntimeError(f"No frames found under {pyframes_dir}")
+        try:
+            sr_local, audio_local = wavfile.read(audio_wav_path)
+            if sr_local <= 0 or audio_local is None or len(audio_local) <= 0:
+                raise RuntimeError("Invalid audio for FPS derivation")
+            dur_local = float(len(audio_local)) / float(sr_local)
+            if dur_local <= 0:
+                raise RuntimeError("Non-positive audio duration for FPS derivation")
+            fps_eff_local = float(n_frames_local) / dur_local
+            if fps_eff_local <= 0:
+                raise RuntimeError("Computed non-positive effective FPS")
+            return fps_eff_local
+        except Exception:
+            cap_local = cv2.VideoCapture(fallback_video_path)
+            fps_v = float(cap_local.get(cv2.CAP_PROP_FPS))
+            cap_local.release()
+            if fps_v is None or fps_v <= 0:
+                raise RuntimeError("Unable to derive FPS from frames+audio or container video")
+            return fps_v
+
+    try:
+        args.videoFps = _compute_effective_fps(args.pyframesPath, args.audioFilePath, args.videoFilePath)
+        sys.stderr.write(f"Using effective FPS for timeline alignment: {args.videoFps:.6f}\n")
+    except Exception as e:
+        raise RuntimeError(f"Failed to determine effective FPS: {e}")
+
     # Scene detection for the video frames
     scene_path = os.path.join(args.pyworkPath, 'scene.pckl')
     if os.path.exists(scene_path):
@@ -970,21 +1025,7 @@ def process_video():
             pickle.dump(vidTracks, fil)
         sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face Crop and saved in %s tracks \r\n" %args.pycropPath)
 
-    # Identity verification (DeepFace stage)
-    identity_tracks_path = os.path.join(args.pyworkPath, 'tracks_identity.pckl')
-    if os.path.exists(identity_tracks_path):
-        sys.stderr.write("Loading existing identity tracks from %s \r\n" % identity_tracks_path)
-        with open(identity_tracks_path, 'rb') as fil:
-            annotated_tracks = pickle.load(fil)
-    else:
-        sys.stderr.write("Starting identity verification with DeepFace... This may take a while for CUDA initialization.\r\n")
-        verifier = IdentityVerifier()
-        annotated_tracks = verifier.annotate_identities(vidTracks)
-        with open(identity_tracks_path, 'wb') as fil:
-            pickle.dump(annotated_tracks, fil)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Tracks with identity extracted and saved in %s \r\n" %args.pyworkPath)
-
-    # Active Speaker Detection by TalkNet
+    # Active Speaker Detection by TalkNet (compute before identities to use ASD-gated embeddings)
     scores_path = os.path.join(args.pyworkPath, 'scores.pckl')
     if os.path.exists(scores_path):
         sys.stderr.write("Loading existing scores from %s \r\n" % scores_path)
@@ -997,6 +1038,24 @@ def process_video():
         with open(scores_path, 'wb') as fil:
             pickle.dump(scores, fil)
         sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scores extracted and saved in %s \r\n" %args.pyworkPath)
+
+    # Identity assignment via episode-level visual clustering (stable VID_* labels)
+    identity_tracks_path = os.path.join(args.pyworkPath, 'tracks_identity.pckl')
+    if os.path.exists(identity_tracks_path):
+        sys.stderr.write("Loading existing identity tracks from %s \r\n" % identity_tracks_path)
+        with open(identity_tracks_path, 'rb') as fil:
+            annotated_tracks = pickle.load(fil)
+    else:
+        sys.stderr.write("Clustering visual identities with constraints (ASD-gated embeddings)...\r\n")
+        # Relax ASD gating thresholds to ensure tracks get embeddings even if ASD is conservative
+        # For identity stability, cluster purely by visual similarity and constraints (no ASD gating)
+        annotated_tracks = cluster_visual_identities(
+            vidTracks,
+            scores_list=None,
+        )
+        with open(identity_tracks_path, 'wb') as fil:
+            pickle.dump(annotated_tracks, fil)
+        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Tracks with clustered identities saved in %s \r\n" % args.pyworkPath)
 
     # Speech diarization
     raw_diarization_path = os.path.join(args.pyworkPath, 'raw_diriazation.pckl')
@@ -1018,9 +1077,11 @@ def process_video():
         with open(matched_diarization_path, 'rb') as fil:
             corrected_results = pickle.load(fil)
     else:
-        # Simple speaker-identity matching
+        # Simple speaker-identity matching with correctly aligned FPS
+        if not hasattr(args, 'videoFps') or args.videoFps is None or args.videoFps <= 0:
+            raise RuntimeError("Missing or invalid args.videoFps; cannot align diarization to tracks.")
         matched_results = match_speaker_identity(
-            annotated_tracks, scores, raw_results["segments"], fps=25
+            annotated_tracks, scores, raw_results["segments"], fps=float(args.videoFps)
         )
         
         corrected_results = autofill_and_correct_matches(matched_results)
