@@ -253,36 +253,71 @@ def evaluate_network(files, args):
 	return allScores
 
 def visualization(tracks, scores, args):
-	# CPU: visulize the result for video format
-	flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg'))
-	flist.sort()
-	faces = [[] for i in range(len(flist))]
-	for tidx, track in enumerate(tracks):
-		score = scores[tidx]
-		for fidx, frame in enumerate(track['track']['frame'].tolist()):
-			s = score[max(fidx - 2, 0): min(fidx + 3, len(score) - 1)] # average smoothing
-			s = numpy.mean(s)
-			faces[frame].append({'track':tidx, 'score':float(s),'s':track['proc_track']['s'][fidx], 'x':track['proc_track']['x'][fidx], 'y':track['proc_track']['y'][fidx]})
-	firstImage = cv2.imread(flist[0])
-	fw = firstImage.shape[1]
-	fh = firstImage.shape[0]
-	vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw,fh))
-	# Fixed overlay colors per spec (BGR): green=#92d051, red=#db3a3c
-	GREEN_BGR = (81, 208, 146)
-	RED_BGR = (60, 58, 219)
-	for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
-		image = cv2.imread(fname)
-		for face in faces[fidx]:
-			color = GREEN_BGR if face['score'] >= 0 else RED_BGR
-			txt = round(face['score'], 1)
-			cv2.rectangle(image, (int(face['x']-face['s']), int(face['y']-face['s'])), (int(face['x']+face['s']), int(face['y']+face['s'])), color, 10)
-			cv2.putText(image,'%s'%(txt), (int(face['x']-face['s']), int(face['y']-face['s'])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color,5)
-		vOut.write(image)
-	vOut.release()
-	command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
-		(os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'), \
-		args.nDataLoaderThread, os.path.join(args.pyaviPath,'video_out.avi'))) 
-	output = subprocess.call(command, shell=True, stdout=None)
+    # CPU: visualize the result for video format
+    flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg'))
+    flist.sort()
+    faces = [[] for i in range(len(flist))]
+
+    # Require identity for color assignment; no fallback to track index
+    # Build mapping: track index -> identity string
+    id_map = {}
+    for tidx, tr in enumerate(tracks):
+        ident = tr.get('identity', None)
+        if ident is None or str(ident).strip() in ('', 'None', 'null'):
+            raise RuntimeError('visualization requires tracks with identity labels; missing identity for one or more tracks. '\
+                               'Run identity clustering first and pass annotated tracks.')
+        id_map[tidx] = str(ident)
+
+    # Deterministic identity->color (BGR-255) using HSV hash for wide palette
+    def _id_to_bgr(id_str):
+        import hashlib
+        hval = int(hashlib.md5(id_str.encode('utf-8')).hexdigest()[:6], 16)
+        H = hval % 180  # OpenCV Hue range [0,179]
+        S = 200
+        V = 230
+        hsv = numpy.uint8([[[H, S, V]]])
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0,0,:]
+        return (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+
+    color_map = {}
+    for ident in set(id_map.values()):
+        color_map[ident] = _id_to_bgr(ident)
+
+    # Prepare per-frame face list with smoothed ASD score
+    for tidx, track in enumerate(tracks):
+        score = scores[tidx]
+        frames_list = track['track']['frame'].tolist()
+        xs = track['proc_track']['x']
+        ys = track['proc_track']['y']
+        ss = track['proc_track']['s']
+        for fidx, frame in enumerate(frames_list):
+            s = score[max(fidx - 2, 0): min(fidx + 3, len(score) - 1)]  # average smoothing
+            s = numpy.mean(s)
+            faces[frame].append({'track': tidx, 'score': float(s), 's': ss[fidx], 'x': xs[fidx], 'y': ys[fidx]})
+
+    firstImage = cv2.imread(flist[0])
+    fw = firstImage.shape[1]
+    fh = firstImage.shape[0]
+    vOut = cv2.VideoWriter(os.path.join(args.pyaviPath, 'video_only.avi'), cv2.VideoWriter_fourcc(*'XVID'), 25, (fw,fh))
+
+    for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
+        image = cv2.imread(fname)
+        for face in faces[fidx]:
+            ident = id_map[face['track']]
+            color = color_map[ident]
+            speaking = (face['score'] >= 0)
+            thickness = 10 if speaking else 3
+            x0, y0 = int(face['x']-face['s']), int(face['y']-face['s'])
+            x1, y1 = int(face['x']+face['s']), int(face['y']+face['s'])
+            cv2.rectangle(image, (x0, y0), (x1, y1), color, thickness, lineType=cv2.LINE_AA)
+            txt = round(face['score'], 1)
+            cv2.putText(image, '%s'%(txt), (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 5)
+        vOut.write(image)
+    vOut.release()
+    command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
+        (os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'), \
+        args.nDataLoaderThread, os.path.join(args.pyaviPath,'video_out.avi'))) 
+    output = subprocess.call(command, shell=True, stdout=None)
 
 def evaluate_col_ASD(tracks, scores, args):
 	txtPath = args.videoFolder + '/col_labels/fusion/*.txt' # Load labels

@@ -248,10 +248,16 @@ def visualization(tracks, scores, args):
     faces = [[] for i in range(len(flist))]
     for tidx, track in enumerate(tracks):
         score = scores[tidx]
+        identity = track.get('identity', 'None')
         for fidx, frame in enumerate(track['track']['frame'].tolist()):
             s = score[max(fidx - 2, 0): min(fidx + 3, len(score) - 1)] # average smoothing
             s = numpy.mean(s)
-            faces[frame].append({'track':tidx, 'score':float(s),'s':track['proc_track']['s'][fidx], 'x':track['proc_track']['x'][fidx], 'y':track['proc_track']['y'][fidx]})
+            faces[frame].append({'track':tidx,
+                                 'identity': identity,
+                                 'score':float(s),
+                                 's':track['proc_track']['s'][fidx],
+                                 'x':track['proc_track']['x'][fidx],
+                                 'y':track['proc_track']['y'][fidx]})
     firstImage = cv2.imread(flist[0])
     fw = firstImage.shape[1]
     fh = firstImage.shape[0]
@@ -263,16 +269,36 @@ def visualization(tracks, scores, args):
         float(args.videoFps),
         (fw, fh)
     )
-    # Use specified brand colors (OpenCV expects BGR)
-    GREEN_BGR = (81, 208, 146)  # #92d051
-    RED_BGR = (60, 58, 219)     # #db3a3c
+    # Build a stable color map per identity (BGR)
+    def _id_color_map(tracks_list):
+        ids = []
+        for tr in tracks_list:
+            ident = tr.get('identity', None)
+            if ident is None or ident == 'None':
+                continue
+            ids.append(ident)
+        uniq = sorted(set(ids))
+        colors = {}
+        import colorsys, hashlib
+        for ident in uniq:
+            hval = int(hashlib.md5(ident.encode('utf-8')).hexdigest()[:8], 16)
+            h = (hval % 360) / 360.0
+            s = 0.65
+            v = 0.95
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            colors[ident] = (int(b * 255), int(g * 255), int(r * 255))
+        return colors
+    ID_COLORS = _id_color_map(tracks)
     for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
         image = cv2.imread(fname)
         for face in faces[fidx]:
-            color = GREEN_BGR if face['score'] >= 0 else RED_BGR
-            txt = round(face['score'], 1)
-            cv2.rectangle(image, (int(face['x']-face['s']), int(face['y']-face['s'])), (int(face['x']+face['s']), int(face['y']+face['s'])), color, 10)
-            cv2.putText(image,'%s'%(txt), (int(face['x']-face['s']), int(face['y']-face['s'])), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color,5)
+            ident = face.get('identity', 'None')
+            color = ID_COLORS.get(ident, (200, 200, 200))
+            x1, y1 = int(face['x']-face['s']), int(face['y']-face['s'])
+            x2, y2 = int(face['x']+face['s']), int(face['y']+face['s'])
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 10)
+            if face['score'] > 0 and isinstance(ident, str) and ident != 'None':
+                cv2.putText(image, ident, (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 5)
         vOut.write(image)
     vOut.release()
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
@@ -815,31 +841,48 @@ def visualization(tracks, scores, diarization_results, args):
         (fw, fh),
         True,
     )
-    # Fixed overlay colors per spec (BGR): green=#92d051, red=#db3a3c
-    GREEN_BGR = (81, 208, 146)
-    RED_BGR = (60, 58, 219)
+    # Build a stable color map per identity (BGR)
+    def _id_color_map(tracks_list):
+        ids = []
+        for tr in tracks_list:
+            ident = tr.get('identity', None)
+            if ident is None or ident == 'None':
+                continue
+            ids.append(ident)
+        uniq = sorted(set(ids))
+        colors = {}
+        import colorsys, hashlib
+        for ident in uniq:
+            hval = int(hashlib.md5(ident.encode('utf-8')).hexdigest()[:8], 16)
+            h = (hval % 360) / 360.0
+            s = 0.65
+            v = 0.95
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            colors[ident] = (int(b * 255), int(g * 255), int(r * 255))
+        return colors
+
+    ID_COLORS = _id_color_map(tracks)
 
     for fidx, fname in tqdm.tqdm(enumerate(flist), total=len(flist)):
         image = cv2.imread(fname)
 
         for face in faces[fidx]:
-            color = GREEN_BGR if face['score'] >= 0 else RED_BGR
-            txt = f"{face['identity']}: {round(face['score'], 1)}"  # Format as "ID_1: 2.5"
+            ident = face['identity']
+            color = ID_COLORS.get(ident, (200, 200, 200))
             bbox_x = int(face['x'] - face['s'])
             bbox_y = int(face['y'] - face['s'])
             bbox_x = max(0, min(bbox_x, fw - 1))
             bbox_y = max(0, min(bbox_y, fh - 1))
 
-            # Draw bounding box
+            # Draw bounding box (always). Show ID label only for active speaker (score > 0)
             cv2.rectangle(image,
                           (bbox_x, bbox_y),
                           (int(face['x'] + face['s']), int(face['y'] + face['s'])),
                           color, 5)
-
-            # Smaller font for ID and score on the same line
-            cv2.putText(image, txt,
-                        (bbox_x, bbox_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                        color, 3)
+            if face['score'] > 0 and isinstance(ident, str) and ident != 'None':
+                cv2.putText(image, ident,
+                            (bbox_x, bbox_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                            color, 3)
 
         vOut.write(image)
 

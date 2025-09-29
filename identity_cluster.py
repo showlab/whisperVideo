@@ -5,11 +5,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Reuse the existing facenet-based embedder for per-track embeddings
-try:
-    from .identity_verifier import IdentityVerifier
-except Exception:
-    from identity_verifier import IdentityVerifier
+import os
+# Embedding backends: default to MagFace; allow override via IDENTITY_EMBEDDER env
+def _build_embedder(device: str = "cuda", batch_size: int = 16):
+    backend = os.environ.get("IDENTITY_EMBEDDER", "magface").strip().lower()
+    if backend == "magface":
+        try:
+            from .embedders.magface_embedder import MagFaceEmbedder
+        except Exception:
+            from embedders.magface_embedder import MagFaceEmbedder
+        return MagFaceEmbedder(device=device, batch_size=batch_size, backbone=os.environ.get("MAGFACE_BACKBONE", "iresnet100"))
+    elif backend == "facenet":
+        try:
+            from .identity_verifier import IdentityVerifier
+        except Exception:
+            from identity_verifier import IdentityVerifier
+        return IdentityVerifier(device=device, batch_size=batch_size)
+    else:
+        raise RuntimeError(f"Unsupported IDENTITY_EMBEDDER backend: {backend}")
 
 
 def _frames_to_bbox_map(track: Dict) -> Dict[int, Tuple[float, float, float, float]]:
@@ -92,7 +105,7 @@ def cluster_visual_identities(
         device = "cpu"
 
     # 1) Per-track embedding via facenet
-    embedder = IdentityVerifier(device=device, batch_size=batch_size)
+    embedder = _build_embedder(device=device, batch_size=batch_size)
     embs: List[Optional[torch.Tensor]] = []  # each (1, D) or None
     valid_idx: List[int] = []
     # Scheme A: skip tracks with no positive ASD frames when scores_list provided
@@ -137,7 +150,11 @@ def cluster_visual_identities(
                 idx = [k for k, v in enumerate(sc) if float(v) > asd_score_thresh]
                 if len(idx) > 0:
                     active_idx = idx
-        emb = embedder._track_embedding(crop_file + ".avi", active_indices=active_idx)
+        # Identity backends expose a common method name
+        if hasattr(embedder, "track_embedding"):
+            emb = embedder.track_embedding(crop_file + ".avi", active_indices=active_idx)
+        else:
+            emb = embedder._track_embedding(crop_file + ".avi", active_indices=active_idx)
         if emb is None:
             embs.append(None)
             continue
