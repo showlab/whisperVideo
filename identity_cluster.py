@@ -104,9 +104,9 @@ def cluster_visual_identities(
     if device == "cuda" and not torch.cuda.is_available():
         device = "cpu"
 
-    # 1) Per-track embedding via facenet
+    # 1) Per-track embedding (single prototype per track)
     embedder = _build_embedder(device=device, batch_size=batch_size)
-    embs: List[Optional[torch.Tensor]] = []  # each (1, D) or None
+    embs: List[Optional[torch.Tensor]] = []  # (1,D) per track or None
     valid_idx: List[int] = []
     # Scheme A: skip tracks with no positive ASD frames when scores_list provided
     include_track = [True] * len(vidTracks)
@@ -140,7 +140,7 @@ def cluster_visual_identities(
     for i, tr in enumerate(vidTracks):
         crop_file = tr.get("cropFile")
         if not crop_file or not include_track[i]:
-            embs.append(None)
+            track_sets.append(None)
             continue
         # Optional ASD gating: use positive-score frame indices if provided
         active_idx = None
@@ -205,18 +205,26 @@ def cluster_visual_identities(
         r = dsu.find(i)
         groups.setdefault(r, []).append(i)
     group_ids = list(groups.keys())
-
     # 4) Group embeddings (mean of member embs)
     grp_embs: Dict[int, torch.Tensor] = {}
     for gid, members in groups.items():
         vecs = [embs[m] for m in members if embs[m] is not None]
         if not vecs:
-            # rare: no emb -> random small vector? better: skip clustering, treat as singleton with zero vector
             raise RuntimeError("Encountered a group without embeddings; aborting to avoid fake data.")
         V = torch.cat(vecs, dim=0)  # (k, D)
         V = F.normalize(V, p=2, dim=1)
         m = F.normalize(V.mean(dim=0, keepdim=True), p=2, dim=1)  # (1, D)
         grp_embs[gid] = m
+
+    # Helper: can we merge two groups under cannot-link constraints?
+    def can_merge(a_gid: int, b_gid: int) -> bool:
+        A = groups[a_gid]
+        B = groups[b_gid]
+        for i in A:
+            for j in B:
+                if frozenset((i, j)) in cannot:
+                    return False
+        return True
 
     # Helper: can we merge two groups under cannot-link constraints?
     def can_merge(a_gid: int, b_gid: int) -> bool:
@@ -240,9 +248,11 @@ def cluster_visual_identities(
             ea = grp_embs[ga]
             for b in range(a + 1, L):
                 gb = act_list[b]
+                if not can_merge(ga, gb):
+                    continue
                 eb = grp_embs[gb]
                 sim = float(F.cosine_similarity(ea, eb).item())
-                if sim >= best_sim and can_merge(ga, gb):
+                if sim >= best_sim:
                     best_sim = sim
                     best_pair = (ga, gb)
         if best_pair is None:

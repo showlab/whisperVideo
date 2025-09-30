@@ -376,3 +376,57 @@ class MagFaceEmbedder:
         emb = (Fcat * w).sum(dim=0, keepdim=True) / (w.sum() + 1e-8)
         emb = F.normalize(emb, p=2, dim=1)
         return emb
+
+    @torch.no_grad()
+    def frame_embeddings(
+        self,
+        track_file: str,
+        active_indices: Optional[List[int]] = None,
+        max_samples: int = 15,
+        top_k: Optional[int] = None,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """Return per-frame embeddings and quality magnitudes for a track.
+
+        - Embeddings are L2-normalized (N, 512) float tensors on self.device
+        - Magnitudes are L2 norms before normalization (N,) indicating quality
+        - If top_k specified, keep the top_k frames by magnitude
+        """
+        cap = cv2.VideoCapture(track_file)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            cap.release()
+            return None
+        positions = self._sample_indices(total_frames, active_indices, max_samples=max_samples)
+        if not positions:
+            cap.release()
+            return None
+        tensors = []
+        for pos in positions:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            t = self._align_and_preprocess(frame)
+            if t is not None:
+                tensors.append(t)
+        cap.release()
+        if not tensors:
+            return None
+        feats = []
+        mags = []
+        for i in range(0, len(tensors), self.batch_size):
+            batch = torch.stack(tensors[i : i + self.batch_size], dim=0).to(self.device)
+            out = self.model(batch)  # (B, 512)
+            mag = torch.norm(out, p=2, dim=1)  # (B,)
+            out_n = F.normalize(out, p=2, dim=1)
+            feats.append(out_n)
+            mags.append(mag)
+        Fcat = torch.cat(feats, dim=0)
+        Mcat = torch.cat(mags, dim=0)
+        if Fcat.size(0) == 0:
+            return None
+        if top_k is not None and Fcat.size(0) > top_k:
+            vals, idx = torch.topk(Mcat, k=top_k, largest=True)
+            Fcat = Fcat[idx]
+            Mcat = Mcat[idx]
+        return Fcat, Mcat

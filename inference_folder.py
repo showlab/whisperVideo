@@ -58,6 +58,47 @@ if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
     cmd = "gdown --id %s -O %s"%(Link, args.pretrainModel)
     subprocess.call(cmd, shell=True, stdout=None)
 
+
+def _ensure_chinese_font():
+    """Ensure a CJK font exists for ffmpeg/libass to render Chinese subtitles.
+
+    Priority:
+    1) Use env CHINESE_FONT_PATH if provided (requires a valid file). Optional CHINESE_FONT_NAME for force_style.
+    2) Use bundled font at whisperv/fonts/NotoSansCJKsc-Regular.otf; download it if missing.
+    Returns (fonts_dir_abs, font_name_or_None). Raises RuntimeError on failure.
+    """
+    # 1) User-specified font path
+    env_font_path = os.environ.get('CHINESE_FONT_PATH', '').strip()
+    env_font_name = os.environ.get('CHINESE_FONT_NAME', '').strip() or None
+    if env_font_path:
+        if not os.path.isfile(env_font_path):
+            raise RuntimeError(f"CHINESE_FONT_PATH set but file not found: {env_font_path}")
+        return os.path.abspath(os.path.dirname(env_font_path)), env_font_name
+
+    # 2) Bundled Noto Sans CJK SC Regular
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    fonts_dir = os.path.join(_THIS_DIR, 'fonts')
+    os.makedirs(fonts_dir, exist_ok=True)
+    font_path = os.path.join(fonts_dir, 'NotoSansCJKsc-Regular.otf')
+    if not os.path.isfile(font_path):
+        # Download from official repo (large file). Fail loudly on error.
+        url = 'https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf'
+        import urllib.request
+        try:
+            urllib.request.urlretrieve(url, font_path)
+        except Exception as e:
+            # cleanup partial file
+            try:
+                if os.path.exists(font_path):
+                    os.remove(font_path)
+            except Exception:
+                pass
+            raise RuntimeError(f"Failed to download Chinese font: {e}")
+        if not os.path.isfile(font_path) or os.path.getsize(font_path) < 1024 * 1024:
+            raise RuntimeError("Downloaded font file seems invalid or too small.")
+    # Internal name for this font
+    return os.path.abspath(fonts_dir), 'Noto Sans CJK SC'
+
 def scene_detect(args):
     # CPU: Scene detection, output is the list of each shot's time duration
     videoManager = VideoManager([args.videoFilePath])
@@ -899,10 +940,17 @@ def visualization(tracks, scores, diarization_results, args):
                 args.nDataLoaderThread, video_with_audio_path))
     subprocess.call(command, shell=True)
 
-    # Produce a video with subtitles using fast encoding
+    # Produce a video with subtitles using fast encoding (force Chinese-capable font)
     video_with_subtitles_path = os.path.join(args.pyaviPath, 'video_out_with_subtitles.avi')
-    command_with_subtitles = ("ffmpeg -y -i %s -vf subtitles=%s -c:v libx264 -preset ultrafast -crf 23 %s -loglevel panic" %
-                              (video_with_audio_path, output_srt_path, video_with_subtitles_path))
+    fonts_dir_abs, font_name = _ensure_chinese_font()
+    if font_name:
+        vf = f"subtitles={output_srt_path}:fontsdir={fonts_dir_abs}:force_style=FontName={font_name}"
+    else:
+        vf = f"subtitles={output_srt_path}:fontsdir={fonts_dir_abs}"
+    command_with_subtitles = (
+        "ffmpeg -y -i %s -vf \"%s\" -c:v libx264 -preset ultrafast -crf 23 %s -loglevel panic" %
+        (video_with_audio_path, vf, video_with_subtitles_path)
+    )
     subprocess.call(command_with_subtitles, shell=True)
 
     # Produce a video without subtitles using stream copying

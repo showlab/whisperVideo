@@ -110,6 +110,40 @@ class IdentityVerifier:
         emb = F.normalize(emb, p=2, dim=1)  # 1 x 512
         return emb
 
+    @torch.no_grad()
+    def frame_embeddings(self, track_file, active_indices=None, max_samples: int = 15, top_k: int = None):
+        """Return per-frame embeddings (L2-normalized) and raw magnitudes.
+
+        For facenet backend, we treat magnitudes as the L2 norm before normalization.
+        Returns tuple (E, mags) where E is (N,512) on current device, mags is (N,).
+        """
+        tensors = self.get_key_frames(track_file, frame_indices=active_indices, max_samples=max_samples)
+        if not tensors:
+            return None
+        feats = []
+        mags = []
+        for i in range(0, len(tensors), self.batch_size):
+            batch = tensors[i:i + self.batch_size]
+            if not batch:
+                continue
+            x = torch.stack(batch, dim=0).to(self.device)
+            out = self.model(x)  # (B,512)
+            mag = torch.norm(out, p=2, dim=1)
+            out_n = F.normalize(out, p=2, dim=1)
+            feats.append(out_n)
+            mags.append(mag)
+        if not feats:
+            return None
+        E = torch.cat(feats, dim=0)
+        M = torch.cat(mags, dim=0)
+        if E.size(0) == 0:
+            return None
+        if top_k is not None and E.size(0) > top_k:
+            vals, idx = torch.topk(M, k=top_k, largest=True)
+            E = E[idx]
+            M = M[idx]
+        return E, M
+
     def verify_identity(self, track_file, registered_id):
         # Compute embedding for current track
         track_emb = self._track_embedding(track_file)
