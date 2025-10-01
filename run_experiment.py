@@ -175,6 +175,15 @@ def process_episode(episode_root, n_threads=4):
     log("identity assignment (visual constrained clustering)")
     if os.path.exists(id_tracks_p):
         annotated_tracks = _load_pickle(id_tracks_p)
+        # Normalize legacy VID_* -> Person_* and persist
+        changed = False
+        for tr in annotated_tracks:
+            ident = tr.get('identity')
+            if isinstance(ident, str) and ident.startswith('VID_'):
+                tr['identity'] = 'Person_' + ident.split('_', 1)[1]
+                changed = True
+        if changed:
+            _save_pickle(annotated_tracks, id_tracks_p)
     else:
         try:
             from .identity_cluster import cluster_visual_identities
@@ -185,11 +194,11 @@ def process_episode(episode_root, n_threads=4):
 
     # WhisperX transcription + alignment + diarization (constrained by speaker count)
     # Data-driven K selection by speaking-time coverage:
-    # 1) Count visual identities (VID_*)
+    # 1) Count visual identities (Person_*)
     vis_ids = set()
     for tr in annotated_tracks:
         ident = tr.get('identity')
-        if isinstance(ident, str) and ident.startswith('VID_'):
+        if isinstance(ident, str) and ident.startswith('Person_'):
             vis_ids.add(ident)
     K_vis = max(1, len(vis_ids))
 
@@ -199,7 +208,7 @@ def process_episode(episode_root, n_threads=4):
     total_speaking = 0
     for i, tr in enumerate(annotated_tracks):
         ident = tr.get('identity')
-        if not (isinstance(ident, str) and ident.startswith('VID_')):
+        if not (isinstance(ident, str) and ident.startswith('Person_')):
             continue
         if i >= len(scores):
             continue
@@ -258,6 +267,15 @@ def process_episode(episode_root, n_threads=4):
     matched_p = os.path.join(result_dir, 'matched_diriazation.pckl')
     if os.path.exists(matched_p):
         corrected_results = _load_pickle(matched_p)
+        # Normalize legacy VID_* -> Person_* in diarization results and persist
+        changed = False
+        for r in corrected_results:
+            ident = r.get('identity')
+            if isinstance(ident, str) and ident.startswith('VID_'):
+                r['identity'] = 'Person_' + ident.split('_', 1)[1]
+                changed = True
+        if changed:
+            _save_pickle(corrected_results, matched_p)
     else:
         matched_results = inf.match_speaker_identity(
             annotated_tracks, scores, raw_results["segments"], fps=25

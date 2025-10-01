@@ -305,13 +305,14 @@ def visualization(tracks, scores, args):
         for face in faces[fidx]:
             ident = id_map[face['track']]
             color = color_map[ident]
-            speaking = (face['score'] >= 0)
+            speaking = (face['score'] > 0)
             thickness = 10 if speaking else 3
             x0, y0 = int(face['x']-face['s']), int(face['y']-face['s'])
             x1, y1 = int(face['x']+face['s']), int(face['y']+face['s'])
             cv2.rectangle(image, (x0, y0), (x1, y1), color, thickness, lineType=cv2.LINE_AA)
-            txt = round(face['score'], 1)
-            cv2.putText(image, '%s'%(txt), (x0, y0), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 5)
+            # Always show Person_[ID]; append " (speaking)" when speaking
+            label = f"{ident}" + (" (speaking)" if speaking else "")
+            cv2.putText(image, label, (x0, max(0, y0 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
         vOut.write(image)
     vOut.release()
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \

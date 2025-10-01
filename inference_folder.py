@@ -283,7 +283,7 @@ def evaluate_network(files, args):
     return allScores
 
 def visualization(tracks, scores, args):
-    # CPU: visulize the result for video format
+    # CPU: visualize the result for video format
     flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg'))
     flist.sort()
     faces = [[] for i in range(len(flist))]
@@ -338,8 +338,10 @@ def visualization(tracks, scores, args):
             x1, y1 = int(face['x']-face['s']), int(face['y']-face['s'])
             x2, y2 = int(face['x']+face['s']), int(face['y']+face['s'])
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 10)
-            if face['score'] > 0 and isinstance(ident, str) and ident != 'None':
-                cv2.putText(image, ident, (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 5)
+            # Always show label; append " (speaking)" when active
+            if isinstance(ident, str) and ident != 'None':
+                label = ident + (" (speaking)" if face['score'] > 0 else "")
+                cv2.putText(image, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
         vOut.write(image)
     vOut.release()
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
@@ -393,7 +395,7 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
     # compute_type = "int8" # change to "int8" if low on GPU mem (may reduce accuracy)
 
     # 1. Transcribe with original whisper (batched)
-    model = whisperx.load_model("small", device, compute_type=compute_type)
+    model = whisperx.load_model("medium", device, compute_type=compute_type)
 
     audio = whisperx.load_audio(audio_file)
     result = model.transcribe(audio, batch_size=batch_size)
@@ -811,29 +813,198 @@ def seconds_to_srt_time(seconds):
     milliseconds = int((seconds - int(seconds)) * 1000)
     return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02},{milliseconds:03}"
 
-def generate_srt(diarization_results, output_srt_path):
-    subs = pysrt.SubRipFile()
-
-    # Use explicit SubRipTime construction to avoid parser edge-cases
-    for idx, segment in enumerate(diarization_results):
-        identity = segment.get('identity')
-        if identity is None or identity == 'None':
+def _wrap_text_for_ass(text: str, max_chars_cn: int = 18, max_chars_lat: int = 28) -> str:
+    # Basic punctuation-aware wrapping: prefer breaking at sentence-ending punctuation, then spaces, otherwise hard-wrap.
+    if not text:
+        return ""
+    # Normalize braces to avoid colliding with ASS override tags
+    t = str(text).replace('{', '(').replace('}', ')')
+    # Detect CJK presence
+    has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in t)
+    maxw = max_chars_cn if has_cjk else max_chars_lat
+    # Split by sentence punctuation first
+    seps = ['。','！','？','；','!','?',';']
+    parts = []
+    buf = ''
+    for ch in t:
+        buf += ch
+        if ch in seps:
+            parts.append(buf.strip())
+            buf = ''
+    if buf.strip():
+        parts.append(buf.strip())
+    # Wrap each part to max width
+    lines = []
+    for p in parts:
+        if len(p) <= maxw:
+            lines.append(p)
             continue
+        if has_cjk:
+            # Hard-wrap every maxw characters
+            for i in range(0, len(p), maxw):
+                lines.append(p[i:i+maxw])
+        else:
+            # Word-aware wrap for latin text
+            cur = []
+            cur_len = 0
+            for w in p.split():
+                if (cur_len + (1 if cur else 0) + len(w)) > maxw:
+                    lines.append(' '.join(cur))
+                    cur = [w]
+                    cur_len = len(w)
+                else:
+                    cur.append(w)
+                    cur_len += (1 if cur_len>0 else 0) + len(w)
+            if cur:
+                lines.append(' '.join(cur))
+    return '\\N'.join([ln for ln in (ln.strip() for ln in lines) if ln])
 
-        st = float(segment.get('start_time', 0.0))
-        et = float(segment.get('end_time', st))
-        text = segment.get('text', '')
+def _bgr_to_ass_hex(color_bgr):
+    # ASS expects &HBBGGRR (no alpha here; alpha handled separately in styles)
+    b, g, r = color_bgr
+    return f"&H{b:02X}{g:02X}{r:02X}"
 
-        start_ms = int(round(st * 1000.0))
-        end_ms = int(round(et * 1000.0))
+def _normalize_identity_prefix(ident: str) -> str:
+    if isinstance(ident, str) and ident.startswith('VID_'):
+        return 'Person_' + ident.split('_', 1)[1]
+    return ident
 
-        start_time = pysrt.SubRipTime(milliseconds=start_ms)
-        end_time = pysrt.SubRipTime(milliseconds=end_ms)
+def _collapse_to_single_line(segments):
+    # Ensure at most one subtitle is active at any time by trimming previous end to next start
+    # Input: list of dicts with 'start'/'start_time' and 'end'/'end_time'
+    # Output: new list with no overlaps
+    canon = []
+    for seg in segments:
+        s = float(seg.get('start', seg.get('start_time', 0.0)))
+        e = float(seg.get('end', seg.get('end_time', s)))
+        if e > s:
+            canon.append({'start': s, 'end': e, 'identity': seg.get('identity'), 'text': seg.get('text', '')})
+    if not canon:
+        return []
+    canon.sort(key=lambda x: (x['start'], x['end']))
+    out = []
+    for seg in canon:
+        if not out:
+            out.append(seg)
+            continue
+        prev = out[-1]
+        if seg['start'] < prev['end']:
+            # trim previous to avoid overlap; drop if becomes invalid
+            new_end = max(prev['start'], min(prev['end'], seg['start']))
+            prev['end'] = new_end
+            if prev['end'] <= prev['start']:
+                out.pop()
+        out.append(seg)
+    # Final cleanup: remove any non-positive durations
+    out2 = [s for s in out if (s['end'] - s['start']) > 1e-3]
+    return out2
 
-        subtitle_text = f"{identity}: {text}"
-        subs.append(pysrt.SubRipItem(index=idx + 1, start=start_time, end=end_time, text=subtitle_text))
+def generate_ass(diarization_results, output_ass_path, id_colors_map, font_name_override=None):
+    # Build ASS header + events with inline color for Person_[ID]
+    font_name = font_name_override or 'Noto Sans CJK SC'
+    header = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "YCbCr Matrix: TV.601",
+        "PlayResX: 1280",
+        "PlayResY: 720",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{font_name},42,&H00FFFFFF,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,30,30,30,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    lines = []
+    # Collapse to one-line-at-a-time display to avoid multiple lines showing together
+    collapsed = _collapse_to_single_line(diarization_results)
+    for seg in collapsed:
+        ident = _normalize_identity_prefix(seg.get('identity'))
+        if not ident or ident == 'None':
+            continue
+        st = float(seg.get('start', 0.0))
+        et = float(seg.get('end', st))
+        if et <= st:
+            continue
+        raw_text = str(seg.get('text', ''))
+        text_wrapped = _wrap_text_for_ass(raw_text)
+        # Colorize only the Person_[ID] prefix to match box color; keep rest as default (white)
+        color = id_colors_map.get(ident, id_colors_map.get(_normalize_identity_prefix(ident), (255,255,255)))
+        ass_hex = _bgr_to_ass_hex(color)
+        # Build dialogue text: colored ident + reset to default for the rest
+        # Use \N for line breaks from wrapper
+        # Note: reset color with {\c&HFFFFFF&}
+        prefix = f"{{\\c{ass_hex}}}{ident}{{\\c&HFFFFFF&}}: "
+        ass_text = prefix + text_wrapped
+        # Time in h:mm:ss.cs (ASS uses centiseconds)
+        def _ass_time(t):
+            h = int(t // 3600)
+            m = int((t % 3600) // 60)
+            s = int(t % 60)
+            cs = int(round((t - int(t)) * 100))
+            return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+        lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(et)},Default,,0,0,0,,{ass_text}")
+    with open(output_ass_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(header + lines))
 
-    subs.save(output_srt_path, encoding='utf-8')
+def generate_ass_seq(diarization_results, output_ass_path, id_colors_map, font_name_override=None):
+    # Build ASS with single-line sequential display per segment (no simultaneous multi-line)
+    font_name = font_name_override or 'Noto Sans CJK SC'
+    header = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "YCbCr Matrix: TV.601",
+        "PlayResX: 1280",
+        "PlayResY: 720",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{font_name},42,&H00FFFFFF,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,30,30,30,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    lines = []
+    collapsed = _collapse_to_single_line(diarization_results)
+    def _ass_time(t):
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        cs = int(round((t - int(t)) * 100))
+        return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
+    for seg in collapsed:
+        ident = _normalize_identity_prefix(seg.get('identity'))
+        if not ident or ident == 'None':
+            continue
+        st = float(seg.get('start', 0.0))
+        et = float(seg.get('end', st))
+        if et <= st:
+            continue
+        raw_text = str(seg.get('text', ''))
+        wrapped = _wrap_text_for_ass(raw_text)
+        parts = [ln for ln in wrapped.split('\\N') if ln.strip()]
+        if not parts:
+            continue
+        dur = max(0.0, et - st)
+        if dur <= 0.0:
+            continue
+        step = dur / len(parts)
+        color = id_colors_map.get(ident, id_colors_map.get(_normalize_identity_prefix(ident), (255,255,255)))
+        ass_hex = _bgr_to_ass_hex(color)
+        for i, ln in enumerate(parts):
+            a = st + i * step
+            b = st + (i + 1) * step if i < len(parts) - 1 else et
+            if b <= a:
+                continue
+            prefix = f"{{\\c{ass_hex}}}{ident}{{\\c&HFFFFFF&}}: "
+            lines.append(f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Default,,0,0,0,,{prefix}{ln}")
+    with open(output_ass_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(header + lines))
 
 def visualization(tracks, scores, diarization_results, args):
     flist = glob.glob(os.path.join(args.pyframesPath, '*.jpg'))
@@ -915,23 +1086,26 @@ def visualization(tracks, scores, diarization_results, args):
             bbox_x = max(0, min(bbox_x, fw - 1))
             bbox_y = max(0, min(bbox_y, fh - 1))
 
-            # Draw bounding box (always). Show ID label only for active speaker (score > 0)
+            # Draw bounding box (always). Always show ID label; append " (speaking)" when speaking
             cv2.rectangle(image,
                           (bbox_x, bbox_y),
                           (int(face['x'] + face['s']), int(face['y'] + face['s'])),
                           color, 5)
-            if face['score'] > 0 and isinstance(ident, str) and ident != 'None':
-                cv2.putText(image, ident,
-                            (bbox_x, bbox_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
+            if isinstance(ident, str) and ident != 'None':
+                label = ident + (" (speaking)" if face['score'] > 0 else "")
+                cv2.putText(image, label,
+                            (bbox_x, max(0, bbox_y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1,
                             color, 3)
 
         vOut.write(image)
 
     vOut.release()
 
-    # Generate SRT file for subtitles
-    output_srt_path = os.path.join(args.pyaviPath, 'subtitles.srt')
-    generate_srt(diarization_results, output_srt_path)
+    # Generate ASS subtitles with color-matched Person_[ID] and line-wrapping
+    output_ass_path = os.path.join(args.pyaviPath, 'subtitles.ass')
+    # Ensure we select a font; reuse the same Chinese-capable font name
+    fonts_dir_abs, font_name = _ensure_chinese_font()
+    generate_ass_seq(diarization_results, output_ass_path, ID_COLORS, font_name_override=font_name or 'Noto Sans CJK SC')
 
     # Optimize audio/video merging with stream copying
     video_with_audio_path = os.path.join(args.pyaviPath, 'video_out_with_audio.avi')
@@ -940,13 +1114,10 @@ def visualization(tracks, scores, diarization_results, args):
                 args.nDataLoaderThread, video_with_audio_path))
     subprocess.call(command, shell=True)
 
-    # Produce a video with subtitles using fast encoding (force Chinese-capable font)
+    # Produce a video with ASS subtitles using fast encoding (force Chinese-capable font directory)
     video_with_subtitles_path = os.path.join(args.pyaviPath, 'video_out_with_subtitles.avi')
-    fonts_dir_abs, font_name = _ensure_chinese_font()
-    if font_name:
-        vf = f"subtitles={output_srt_path}:fontsdir={fonts_dir_abs}:force_style=FontName={font_name}"
-    else:
-        vf = f"subtitles={output_srt_path}:fontsdir={fonts_dir_abs}"
+    # The 'subtitles' filter auto-detects ASS and uses embedded styles; still pass fontsdir for font discovery
+    vf = f"subtitles={output_ass_path}:fontsdir={fonts_dir_abs}"
     command_with_subtitles = (
         "ffmpeg -y -i %s -vf \"%s\" -c:v libx264 -preset ultrafast -crf 23 %s -loglevel panic" %
         (video_with_audio_path, vf, video_with_subtitles_path)
@@ -1136,6 +1307,19 @@ def process_video():
         sys.stderr.write("Loading existing identity tracks from %s \r\n" % identity_tracks_path)
         with open(identity_tracks_path, 'rb') as fil:
             annotated_tracks = pickle.load(fil)
+        # Normalize legacy VID_* -> Person_* for display consistency
+        changed = False
+        for tr in annotated_tracks:
+            ident = tr.get('identity')
+            if isinstance(ident, str) and ident.startswith('VID_'):
+                tr['identity'] = 'Person_' + ident.split('_', 1)[1]
+                changed = True
+        if changed:
+            try:
+                with open(identity_tracks_path, 'wb') as fil:
+                    pickle.dump(annotated_tracks, fil)
+            except Exception:
+                pass
     else:
         sys.stderr.write("Clustering visual identities with constraints (ASD-gated embeddings)...\r\n")
         # Relax ASD gating thresholds to ensure tracks get embeddings even if ASD is conservative
@@ -1148,48 +1332,85 @@ def process_video():
             pickle.dump(annotated_tracks, fil)
         sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Tracks with clustered identities saved in %s \r\n" % args.pyworkPath)
 
-    # Speech diarization
-    raw_diarization_path = os.path.join(args.pyworkPath, 'raw_diriazation.pckl')
-    if os.path.exists(raw_diarization_path):
-        sys.stderr.write("Loading existing raw diarization from %s \r\n" % raw_diarization_path)
-        with open(raw_diarization_path, 'rb') as fil:
-            raw_segments = pickle.load(fil)
-        raw_results = {"segments": raw_segments}
+    # Ensure ASD scores align with current tracks; if not, recompute scores to avoid K fallback issues
+    if not isinstance(scores, list) or len(scores) != len(annotated_tracks):
+        files = sorted(glob.glob(os.path.join(args.pycropPath, '*.avi')))
+        if not files:
+            raise RuntimeError(f"No crop clips found in {args.pycropPath} to recompute ASD scores")
+        sys.stderr.write("Recomputing ASD scores to align with current tracks...\n")
+        scores = evaluate_network(files, args)
+        with open(scores_path, 'wb') as fil:
+            pickle.dump(scores, fil)
+        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scores re-extracted and saved in %s \r\n" %args.pyworkPath)
+
+    # Infer number of speakers (K) from ASD speaking-coverage over visual identities; fall back to existing raw diarization if needed
+    # 1) Collect Person_* identities
+    vis_ids = [tr.get('identity') for tr in annotated_tracks if isinstance(tr.get('identity'), str) and tr.get('identity') != 'None']
+    # 2) Coverage from ASD-positive frames
+    from collections import defaultdict
+    id_speaking = defaultdict(int)
+    for i, tr in enumerate(annotated_tracks):
+        ident = tr.get('identity')
+        if not (isinstance(ident, str) and ident != 'None'):
+            continue
+        sc = scores[i] if i < len(scores) else []
+        if not isinstance(sc, (list, tuple)):
+            continue
+        pos = sum(1 for v in sc if float(v) > 0)
+        if pos > 0:
+            id_speaking[ident] += pos
+    K_used = None
+    if id_speaking:
+        total = sum(id_speaking.values())
+        items = sorted(id_speaking.items(), key=lambda x: x[1], reverse=True)
+        cum = 0
+        K_cov = 0
+        for _, dur in items:
+            cum += dur
+            K_cov += 1
+            if cum >= 0.90 * total:
+                break
+        K_used = max(1, K_cov)
     else:
-        raw_results = speech_diarization()
-        with open(raw_diarization_path, 'wb') as fil:
-            pickle.dump(raw_results["segments"], fil)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Raw diarization extracted and saved in %s \r\n" %args.pyworkPath)
+        # 3) Fallback to existing raw diarization speaker count if available; else visual count
+        raw_diarization_path = os.path.join(args.pyworkPath, 'raw_diriazation.pckl')
+        if os.path.exists(raw_diarization_path):
+            try:
+                with open(raw_diarization_path, 'rb') as fil:
+                    segs = pickle.load(fil)
+                uniq = len(set(str(s.get('speaker')) for s in segs if isinstance(s, dict)))
+                if uniq >= 1:
+                    K_used = uniq
+            except Exception:
+                pass
+        if K_used is None:
+            K_used = max(1, len(set(vis_ids)))
+
+    # 4) Run diarization constrained to K_used and overwrite cache for consistency
+    raw_diarization_path = os.path.join(args.pyworkPath, 'raw_diriazation.pckl')
+    sys.stderr.write(f"whisperx diarization with min/max speakers = {K_used}/{K_used}\n")
+    raw_results = speech_diarization(min_speakers=K_used, max_speakers=K_used)
+    with open(raw_diarization_path, 'wb') as fil:
+        pickle.dump(raw_results["segments"], fil)
+    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Raw diarization saved (constrained) in %s \r\n" %args.pyworkPath)
 
     # Match speaker identity and correct results
     matched_diarization_path = os.path.join(args.pyworkPath, 'matched_diriazation.pckl')
-    if os.path.exists(matched_diarization_path):
-        sys.stderr.write("Loading existing matched diarization from %s \r\n" % matched_diarization_path)
-        with open(matched_diarization_path, 'rb') as fil:
-            corrected_results = pickle.load(fil)
-    else:
-        # Simple speaker-identity matching with correctly aligned FPS
-        if not hasattr(args, 'videoFps') or args.videoFps is None or args.videoFps <= 0:
-            raise RuntimeError("Missing or invalid args.videoFps; cannot align diarization to tracks.")
-        matched_results = match_speaker_identity(
-            annotated_tracks, scores, raw_results["segments"], fps=float(args.videoFps)
-        )
-        
-        corrected_results = autofill_and_correct_matches(matched_results)
-        
-        # Speaker clustering has been removed from the cleaned pipeline.
-        # If grouping is needed, perform it externally during evaluation/analysis.
-        
-        # Log speaker assignment statistics
-        total_segments = len(corrected_results)
-        assigned_segments = sum(1 for r in corrected_results if r['identity'] is not None and r['identity'] != 'None')
-        
-        sys.stderr.write("Speaker assignment: %d/%d segments assigned (%.1f%%)\r\n" % (
-            assigned_segments, total_segments, 100.0 * assigned_segments / max(total_segments, 1)
-        ))
-        with open(matched_diarization_path, 'wb') as fil:
-            pickle.dump(corrected_results, fil)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Corrected diarization extracted and saved in %s \r\n" %args.pyworkPath)
+    # Always recompute matched diarization to reflect constrained raw results
+    if not hasattr(args, 'videoFps') or args.videoFps is None or args.videoFps <= 0:
+        raise RuntimeError("Missing or invalid args.videoFps; cannot align diarization to tracks.")
+    matched_results = match_speaker_identity(
+        annotated_tracks, scores, raw_results["segments"], fps=float(args.videoFps)
+    )
+    corrected_results = autofill_and_correct_matches(matched_results)
+    total_segments = len(corrected_results)
+    assigned_segments = sum(1 for r in corrected_results if r['identity'] is not None and r['identity'] != 'None')
+    sys.stderr.write("Speaker assignment: %d/%d segments assigned (%.1f%%)\r\n" % (
+        assigned_segments, total_segments, 100.0 * assigned_segments / max(total_segments, 1)
+    ))
+    with open(matched_diarization_path, 'wb') as fil:
+        pickle.dump(corrected_results, fil)
+    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Corrected diarization saved in %s \r\n" %args.pyworkPath)
 
     # Visualization, save the result as the new video    
     visualization(annotated_tracks, scores, corrected_results, args)    

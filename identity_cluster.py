@@ -98,7 +98,7 @@ def cluster_visual_identities(
     - Cannot-link: co-visible with low IoU (different persons), forbid merging
     - Greedy agglomerative merging by cosine similarity with threshold and constraints
 
-    Returns a new list mirroring vidTracks but 'identity' set to a stable label: 'VID_1', ...
+    Returns a new list mirroring vidTracks but 'identity' set to a stable label: 'Person_1', ...
     """
 
     if device == "cuda" and not torch.cuda.is_available():
@@ -273,7 +273,8 @@ def cluster_visual_identities(
     # 6) Assign stable identity labels
     stable_ids = {}
     for idx, gid in enumerate(sorted(active)):
-        label = f"VID_{idx+1}"
+        # Use Person_* naming in place of prior VID_*
+        label = f"Person_{idx+1}"
         for m in groups[gid]:
             stable_ids[m] = label
 
