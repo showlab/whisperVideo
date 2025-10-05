@@ -57,8 +57,6 @@ parser.add_argument('--idBatch',              type=int,   default=64,   help='Ba
 parser.add_argument('--asdBatch',             type=int,   default=64,   help='Batch size for ASD window inference')
 parser.add_argument('--cropWorkers',          type=int,   default=8,    help='Parallel workers for audio cut + mux per track')
 parser.add_argument('--sceneWorkers',         type=int,   default=6,    help='Parallel workers for in-memory ASD by scene')
-parser.add_argument('--sam2_memory_num_maskmem', type=int, default=7,   help='Memory-bank size for overlay (SAM2-style): 1 cond + (num_maskmem-1) non-cond frames')
-parser.add_argument('--sam2_memory_stride',     type=int, default=1,   help='Temporal stride for non-conditioning memory frames in overlay')
 parser.add_argument('--sceneMinSec',         type=float, default=1.0,  help='Minimum scene length in seconds (detector min_scene_len)')
 
 args, unknown  = parser.parse_known_args()
@@ -1124,14 +1122,26 @@ def visualization(tracks, scores, args):
         return colors
     ID_COLORS = _id_color_map(tracks)
 
-    # Load memory bank mapping for overlay (required; no fallback)
-    mb_path = os.path.join(args.pyworkPath, 'sam2_memory_bank.pckl')
-    if not os.path.isfile(mb_path):
-        raise FileNotFoundError(f"Missing memory bank file for visualization: {mb_path}")
-    with open(mb_path, 'rb') as f:
-        memory_bank = pickle.load(f)
-    if not isinstance(memory_bank, dict):
-        raise RuntimeError("Loaded memory bank has invalid format (expected dict)")
+    # Build memory ROI map from tracks: per frame f -> list of (mem_frame, x, y, s)
+    M = 6
+    stride = 1
+    mem_rois_by_frame = defaultdict(list)
+    for tr in tracks:
+        frames_arr = tr.get('track', {}).get('frame') if isinstance(tr, dict) else None
+        proc = tr.get('proc_track', {}) if isinstance(tr, dict) else {}
+        if frames_arr is None or not isinstance(proc, dict):
+            continue
+        frames_list = frames_arr.tolist() if hasattr(frames_arr, 'tolist') else list(frames_arr)
+        xs = proc.get('x', []); ys = proc.get('y', []); ss = proc.get('s', [])
+        if not frames_list or not xs or not ys or not ss:
+            continue
+        for l, f in enumerate(frames_list):
+            start = max(0, l - M * stride)
+            idxs = list(range(start, l, stride))
+            for ii in idxs:
+                mf = int(frames_list[ii])
+                x = float(xs[ii]); y = float(ys[ii]); s = float(ss[ii])
+                mem_rois_by_frame[f].append((mf, x, y, s))
 
     # Thumbnail cache and layout (use flist images)
     thumb_cache = {}
@@ -1140,23 +1150,25 @@ def visualization(tracks, scores, args):
     margin = 6
     label_height = 28
 
-    def get_thumb_from_flist(frame_index: int):
-        if frame_index in thumb_cache:
-            return thumb_cache[frame_index]
+    def get_face_thumb_from_flist(frame_index: int, x: float, y: float, s: float):
+        key = (frame_index, int(x), int(y), int(s))
+        if key in thumb_cache:
+            return thumb_cache[key]
         if frame_index < 0 or frame_index >= len(flist):
             return None
         img = cv2.imread(flist[frame_index])
         if img is None:
             return None
         h, w = img.shape[:2]
-        side = min(h, w)
-        y0 = (h - side) // 2
-        x0 = (w - side) // 2
-        crop = img[y0:y0+side, x0:x0+side]
-        if crop.size == 0:
+        x1 = max(0, int(x - s)); y1 = max(0, int(y - s))
+        x2 = min(w, int(x + s)); y2 = min(h, int(y + s))
+        if x2 <= x1 or y2 <= y1:
             return None
-        thumb = cv2.resize(crop, (tile_w, tile_h))
-        thumb_cache[frame_index] = thumb
+        roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+        thumb = cv2.resize(roi, (tile_w, tile_h))
+        thumb_cache[key] = thumb
         return thumb
 
     for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
@@ -1172,12 +1184,12 @@ def visualization(tracks, scores, args):
                 label = ident + (" (speaking)" if face['score'] > 0 else "")
                 cv2.putText(image, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
 
-        # Bottom-left Memory Bank overlay
-        mem_frames = memory_bank.get(fidx, [])
-        if mem_frames:
-            max_cols = max(1, min(6, len(mem_frames)))
-            rows = 1 if len(mem_frames) <= max_cols else 2
-            cols = max_cols if rows == 1 else int(math.ceil(len(mem_frames) / 2.0))
+        # Bottom-left Memory Bank overlay (tracking-based faces)
+        mem_entries = mem_rois_by_frame.get(fidx, [])
+        if mem_entries:
+            max_cols = max(1, min(6, len(mem_entries)))
+            rows = 1 if len(mem_entries) <= max_cols else 2
+            cols = max_cols if rows == 1 else int(math.ceil(len(mem_entries) / 2.0))
             limit = rows * cols
             block_w = cols * tile_w + (cols - 1) * margin
             block_h = rows * tile_h + (rows - 1) * margin + label_height
@@ -1186,12 +1198,12 @@ def visualization(tracks, scores, args):
             cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
             cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
             start_y = y0 + label_height
-            for idx_m, gf in enumerate(mem_frames[:limit]):
+            for idx_m, (gf, mx, my, ms) in enumerate(mem_entries[:limit]):
                 r = idx_m // cols
                 c = idx_m % cols
                 ty = start_y + r * (tile_h + margin)
                 tx = x0 + c * (tile_w + margin)
-                thumb = get_thumb_from_flist(int(gf))
+                thumb = get_face_thumb_from_flist(int(gf), mx, my, ms)
                 if thumb is None:
                     continue
                 h_t, w_t = thumb.shape[:2]
@@ -1618,6 +1630,289 @@ def apply_global_mapping_to_segments(raw_segments, speaker_to_person_map):
         })
     return out
 
+def _per_frame_identity_scores(annotated_tracks, scores):
+    """Build per-frame identity score dict.
+
+    Returns: dict[global_frame] -> dict[identity] = score (float)
+    - For identities with multiple tracks on the same frame, keeps max score.
+    """
+    per_frame = {}
+    for i, tr in enumerate(annotated_tracks):
+        ident = tr.get('identity', None)
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        frames = tr.get('track', {}).get('frame') if isinstance(tr, dict) else None
+        if frames is None:
+            continue
+        sc = scores[i] if i < len(scores) else []
+        try:
+            import numpy as _np
+            sc_arr = _np.asarray(sc, dtype=float)
+        except Exception:
+            continue
+        fr_list = frames.tolist() if hasattr(frames, 'tolist') else list(frames)
+        T = min(len(fr_list), int(sc_arr.shape[0]))
+        for j in range(T):
+            f = int(fr_list[j])
+            v = float(sc_arr[j])
+            m = per_frame.get(f)
+            if m is None:
+                per_frame[f] = {ident: v}
+            else:
+                if ident not in m or v > m[ident]:
+                    m[ident] = v
+    return per_frame
+
+def split_segments_by_frame_argmax(annotated_tracks, scores, raw_segments, fps: float = 25.0, min_run_frames: int = 6):
+    """Split each diarization segment into subsegments by per-frame ASD argmax identity.
+
+    - For each frame in a segment, pick identity with max score among identities present at that frame.
+    - Frames with no identity present in that frame are filled with the sentence-level top identity
+      (by presence count over the segment).
+    - Consecutive frames with same identity are merged; very short runs (< min_run_frames) are
+      absorbed into the longer adjacent neighbor to reduce fragmentation.
+    - Returns list of dicts {'start','end','identity','text'}.
+    """
+    if min_run_frames is None:
+        min_run_frames = 0
+    per_frame = _per_frame_identity_scores(annotated_tracks, scores)
+    out = []
+    for seg in raw_segments:
+        s = float(seg.get('start', seg.get('start_time', 0.0)))
+        e = float(seg.get('end', seg.get('end_time', s)))
+        if e <= s:
+            continue
+        a = int(s * float(fps))
+        b = int(e * float(fps))
+        if b <= a:
+            continue
+        # Determine sentence-level top identity by presence within [a,b)
+        from collections import defaultdict
+        pres = defaultdict(int)
+        for f in range(a, b):
+            m = per_frame.get(f, None)
+            if not m:
+                continue
+            # count presence for identities defined at this frame
+            for ident in m.keys():
+                pres[ident] += 1
+        if not pres:
+            # No identities present over this sentence; cannot label without fake data
+            raise RuntimeError("No identity presence within diarization segment; cannot assign labels.")
+        sent_top = max(pres.items(), key=lambda x: x[1])[0]
+
+        # Build per-frame winners with fill for empty frames
+        winners = []  # list of identity strings, len = b-a
+        frames = list(range(a, b))
+        for f in frames:
+            m = per_frame.get(f, None)
+            if m:
+                # pick highest score identity among those defined at f
+                ident = max(m.items(), key=lambda x: x[1])[0]
+                winners.append(ident)
+            else:
+                # fill with sentence-level top identity to avoid gaps
+                winners.append(sent_top)
+
+        # Run-length compress winners into (start_f, end_f, ident)
+        runs = []
+        cur_ident = None
+        cur_start = None
+        for idx, ident in enumerate(winners):
+            if ident != cur_ident:
+                if cur_ident is not None:
+                    runs.append((frames[cur_start], frames[idx], cur_ident))  # [start, end)
+                cur_ident = ident
+                cur_start = idx
+        if cur_ident is not None:
+            runs.append((frames[cur_start], frames[-1] + 1, cur_ident))
+
+        # Absorb very short runs into longer neighbor to reduce flicker
+        if min_run_frames > 0 and len(runs) >= 2:
+            merged = []
+            i = 0
+            while i < len(runs):
+                rs, re, rid = runs[i]
+                length = re - rs
+                if length >= min_run_frames or len(runs) == 1:
+                    merged.append([rs, re, rid])
+                    i += 1
+                    continue
+                # short run: merge into neighbor with larger duration
+                if i == 0:
+                    # merge right
+                    nr_s, nr_e, nr_id = runs[i + 1]
+                    merged.append([rs, nr_e, nr_id])
+                    i += 2
+                elif i == len(runs) - 1:
+                    # merge left
+                    ml_s, ml_e, ml_id = merged[-1]
+                    merged[-1] = [ml_s, re, ml_id]
+                    i += 1
+                else:
+                    # choose neighbor with longer duration
+                    pl_s, pl_e, pl_id = merged[-1]
+                    nr_s, nr_e, nr_id = runs[i + 1]
+                    if (pl_e - pl_s) >= (nr_e - nr_s):
+                        merged[-1] = [pl_s, re, pl_id]
+                        i += 1
+                    else:
+                        merged.append([rs, nr_e, nr_id])
+                        i += 2
+            # coalesce adjacent same-identity after merges
+            runs2 = []
+            for rs, re, rid in merged:
+                if runs2 and runs2[-1][2] == rid:
+                    runs2[-1][1] = re
+                else:
+                    runs2.append([rs, re, rid])
+            runs = [(rs, re, rid) for rs, re, rid in runs2]
+
+        # Convert runs to segments
+        for rs, re, rid in runs:
+            st = max(s, rs / float(fps))
+            et = min(e, re / float(fps))
+            if et <= st:
+                continue
+            out.append({'start': st, 'end': et, 'identity': rid, 'text': seg.get('text', '')})
+
+    return out
+
+def split_segments_by_positive_fill(annotated_tracks, scores, raw_segments, fps: float = 25.0, min_run_frames: int = 6):
+    """Split each diarization segment into subsegments using ASD>0 evidence first, then fill.
+
+    Strategy (simple and robust):
+    - Build two maps:
+      (1) id_pos_frames: identity -> set of global frames where its ASD score > 0 (merge tracks).
+      (2) per_frame_scores: frame -> {identity: score} to resolve ties/adjacency if needed.
+    - For a sentence [s,e), compute the sentence-level top identity by positive-frame count within [s,e).
+      If no identity has positive frames in [s,e), raise (no fake mapping).
+    - For each frame f in [s,e):
+        * If exactly one identity has score>0 at f -> assign that identity.
+        * Otherwise -> assign sentence-level top identity to avoid gaps.
+    - Run-length compress assignments; absorb runs shorter than min_run_frames into neighbors; coalesce.
+    - Return list of {'start','end','identity','text'}.
+    """
+    # 1) Build maps
+    from collections import defaultdict
+    id_pos = defaultdict(set)
+    per_frame = defaultdict(dict)
+    for i, tr in enumerate(annotated_tracks):
+        ident = tr.get('identity', None)
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        frames = tr.get('track', {}).get('frame')
+        if frames is None:
+            continue
+        fr_list = frames.tolist() if hasattr(frames, 'tolist') else list(frames)
+        sc = scores[i] if i < len(scores) else []
+        try:
+            import numpy as _np
+            sc_arr = _np.asarray(sc, dtype=float)
+        except Exception:
+            sc_arr = []
+        T = min(len(fr_list), int(getattr(sc_arr, 'shape', [0])[0] if hasattr(sc_arr, 'shape') else len(sc)))
+        for j in range(T):
+            f = int(fr_list[j]); v = float(sc_arr[j])
+            if v > 0.0:
+                id_pos[ident].add(f)
+            m = per_frame[f]
+            if (ident not in m) or (v > m[ident]):
+                m[ident] = v
+
+    out = []
+    for seg in raw_segments:
+        s = float(seg.get('start', seg.get('start_time', 0.0)))
+        e = float(seg.get('end', seg.get('end_time', s)))
+        if e <= s:
+            continue
+        a = int(s * float(fps)); b = int(e * float(fps))
+        if b <= a:
+            continue
+        # sentence-level positive winner
+        pos_counts = defaultdict(int)
+        for ident, aset in id_pos.items():
+            # count positive frames within [a,b)
+            c = 0
+            # fast path: iterate over f in [a,b) checking membership
+            for f in range(a, b):
+                if f in aset:
+                    c += 1
+            if c > 0:
+                pos_counts[ident] += c
+        if not pos_counts:
+            raise RuntimeError("No identity with positive ASD within diarization segment; cannot assign labels.")
+        sent_top = max(pos_counts.items(), key=lambda x: x[1])[0]
+
+        # framewise assignment with fill
+        winners = []
+        frames = list(range(a, b))
+        for f in frames:
+            m = per_frame.get(f, None)
+            if not m:
+                winners.append(sent_top)
+                continue
+            pos = [i for i, v in m.items() if v > 0.0]
+            if len(pos) == 1:
+                winners.append(pos[0])
+            else:
+                winners.append(sent_top)
+
+        # RLE
+        runs = []
+        cur_ident = None
+        cur_start = None
+        for idx, ident in enumerate(winners):
+            if ident != cur_ident:
+                if cur_ident is not None:
+                    runs.append((frames[cur_start], frames[idx], cur_ident))
+                cur_ident = ident
+                cur_start = idx
+        if cur_ident is not None:
+            runs.append((frames[cur_start], frames[-1] + 1, cur_ident))
+
+        # absorb short runs
+        if min_run_frames and len(runs) >= 2:
+            merged = []
+            i = 0
+            while i < len(runs):
+                rs, re, rid = runs[i]
+                L = re - rs
+                if L >= min_run_frames or len(runs) == 1:
+                    merged.append([rs, re, rid]); i += 1; continue
+                if i == 0:
+                    nrs, nre, nrid = runs[i + 1]
+                    merged.append([rs, nre, nrid]); i += 2
+                elif i == len(runs) - 1:
+                    prs, pre, prid = merged[-1]
+                    merged[-1] = [prs, re, prid]
+                    i += 1
+                else:
+                    prs, pre, prid = merged[-1]
+                    nrs, nre, nrid = runs[i + 1]
+                    if (pre - prs) >= (nre - nrs):
+                        merged[-1] = [prs, re, prid]
+                        i += 1
+                    else:
+                        merged.append([rs, nre, nrid])
+                        i += 2
+            # coalesce
+            runs2 = []
+            for rs, re, rid in merged:
+                if runs2 and runs2[-1][2] == rid:
+                    runs2[-1][1] = re
+                else:
+                    runs2.append([rs, re, rid])
+            runs = [(rs, re, rid) for rs, re, rid in runs2]
+
+        # emit segments
+        for rs, re, rid in runs:
+            st = max(s, rs / float(fps))
+            et = min(e, re / float(fps))
+            if et <= st:
+                continue
+            out.append({'start': st, 'end': et, 'identity': rid, 'text': seg.get('text', '')})
+    return out
 def _global_top_identity_by_asd(annotated_tracks, scores):
     id_speaking = {}
     for i, tr in enumerate(annotated_tracks):
@@ -2374,50 +2669,77 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
 
     ID_COLORS = _id_color_map(tracks)
 
-    # Load memory bank mapping for overlay (required; no fallback)
-    mb_path = os.path.join(args.pyworkPath, 'sam2_memory_bank.pckl')
-    if not os.path.isfile(mb_path):
-        raise FileNotFoundError(f"Missing memory bank file for visualization: {mb_path}")
-    with open(mb_path, 'rb') as f:
-        memory_bank = pickle.load(f)
-    if not isinstance(memory_bank, dict):
-        raise RuntimeError("Loaded memory bank has invalid format (expected dict)")
-
-    # Prepare a second capture for random access to memory frames
-    cap_mem = cv2.VideoCapture(args.videoFilePath)
-    if not cap_mem.isOpened():
-        raise RuntimeError(f"Failed to open video for memory overlay: {args.videoFilePath}")
-
-    # Thumbnail cache and layout
-    thumb_cache = {}
-    thumb_order = []
-    THUMB_CAP = 500
+    # Build global identity thumbnails: one per Person_* for the whole video (no duplicates)
     tile_w = max(1, min(160, fw // 8))
     tile_h = tile_w
     margin = 6
     label_height = 28
 
-    def get_thumb(frame_index: int):
-        if frame_index in thumb_cache:
-            return thumb_cache[frame_index]
-        cap_mem.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        ret, img = cap_mem.read()
-        if not ret or img is None:
-            return None
-        h, w = img.shape[:2]
-        side = min(h, w)
-        y0 = (h - side) // 2
-        x0 = (w - side) // 2
-        crop = img[y0:y0+side, x0:x0+side]
-        if crop.size == 0:
-            return None
-        thumb = cv2.resize(crop, (tile_w, tile_h))
-        thumb_cache[frame_index] = thumb
-        thumb_order.append(frame_index)
-        if len(thumb_order) > THUMB_CAP:
-            old = thumb_order.pop(0)
-            thumb_cache.pop(old, None)
-        return thumb
+    def _build_identity_thumbs(video_path, tracks_list, scores_list):
+        # Choose a representative frame per identity: prefer max ASD score; otherwise use center frame
+        id_to_repr = {}
+        for i, tr in enumerate(tracks_list):
+            ident = tr.get('identity', None)
+            if not (isinstance(ident, str) and ident not in (None, 'None')):
+                continue
+            frames = tr.get('track', {}).get('frame')
+            proc = tr.get('proc_track', {})
+            if frames is None or not isinstance(proc, dict):
+                continue
+            fr = frames.tolist() if hasattr(frames, 'tolist') else list(frames)
+            if not fr:
+                continue
+            xs = proc.get('x', []); ys = proc.get('y', []); ss = proc.get('s', [])
+            if not xs or not ys or not ss:
+                continue
+            sc = scores_list[i] if i < len(scores_list) else []
+            best = None  # (score, global_frame, local_idx)
+            try:
+                import numpy as _np
+                sc_arr = _np.asarray(sc, dtype=float)
+                T = min(len(fr), int(sc_arr.shape[0]))
+                if T > 0:
+                    j = int(sc_arr[:T].argmax())
+                    best = (float(sc_arr[j]), int(fr[j]), j)
+            except Exception:
+                T = 0
+            if best is None:
+                j = int(len(fr) // 2)
+                best = (float('-inf'), int(fr[j]), j)
+            # Keep the highest-score representative per identity
+            cur = id_to_repr.get(ident)
+            if cur is None or best[0] > cur[0]:
+                # Clamp idx to proc lengths
+                jj = best[2]
+                jj = min(jj, len(xs) - 1, len(ys) - 1, len(ss) - 1)
+                id_to_repr[ident] = (best[0], best[1], float(xs[jj]), float(ys[jj]), float(ss[jj]))
+
+        # Decode representative frames and crop thumbs
+        thumbs = {}
+        cap2 = cv2.VideoCapture(video_path)
+        if not cap2.isOpened():
+            raise RuntimeError(f"Failed to open video for identity thumbnails: {video_path}")
+        for ident, (_score, gf, x, y, s) in id_to_repr.items():
+            if gf < 0:
+                continue
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, int(gf))
+            ret, img = cap2.read()
+            if not ret or img is None:
+                continue
+            h, w = img.shape[:2]
+            x1 = max(0, int(x - s)); y1 = max(0, int(y - s))
+            x2 = min(w, int(x + s)); y2 = min(h, int(y + s))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            roi = img[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            thumb = cv2.resize(roi, (tile_w, tile_h))
+            thumbs[ident] = thumb
+        cap2.release()
+        return thumbs
+
+    ID_THUMBS = _build_identity_thumbs(args.videoFilePath, tracks, scores)
 
     cap = cv2.VideoCapture(args.videoFilePath)
     if not cap.isOpened():
@@ -2443,13 +2765,12 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
                 cv2.putText(image, label,
                             (bbox_x, max(0, bbox_y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1,
                             color, 3)
-        # Bottom-left Memory Bank overlay
-        mem_frames = memory_bank.get(fidx, [])
-        if mem_frames:
-            max_cols = max(1, min(6, len(mem_frames)))
-            rows = 1 if len(mem_frames) <= max_cols else 2
-            cols = max_cols if rows == 1 else int(math.ceil(len(mem_frames) / 2.0))
-            limit = rows * cols
+        # Bottom-left Global Identity Memory (unique per Person_*)
+        if ID_THUMBS:
+            id_list = sorted(ID_THUMBS.keys())
+            max_cols = max(1, min(6, len(id_list)))
+            rows = int(math.ceil(len(id_list) / float(max_cols)))
+            cols = max_cols
             block_w = cols * tile_w + (cols - 1) * margin
             block_h = rows * tile_h + (rows - 1) * margin + label_height
             y0 = max(0, fh - block_h - 10)
@@ -2457,14 +2778,12 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
             cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
             cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
             start_y = y0 + label_height
-            for idx_m, gf in enumerate(mem_frames[:limit]):
+            for idx_m, ident in enumerate(id_list):
                 r = idx_m // cols
                 c = idx_m % cols
                 ty = start_y + r * (tile_h + margin)
                 tx = x0 + c * (tile_w + margin)
-                if gf < 0:
-                    continue
-                thumb = get_thumb(int(gf))
+                thumb = ID_THUMBS.get(ident)
                 if thumb is None:
                     continue
                 h_t, w_t = thumb.shape[:2]
@@ -2475,7 +2794,6 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
         vOut.write(image)
         fidx += 1
     cap.release()
-    cap_mem.release()
     vOut.release()
 
     # Generate ASS subtitles and merge variants
@@ -2863,14 +3181,23 @@ def process_video():
             pickle.dump(raw_results["segments"], fil)
         sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Raw diarization extracted and saved in %s \r\n" %args.pyworkPath)
 
-    # Build a simple global mapping: diarization speaker -> Person_* using visual overlap counts only
+    # Per-segment framewise argmax mapping with minimal run-length smoothing
     matched_diarization_path = os.path.join(args.pyworkPath, 'matched_diriazation.pckl')
-    speaker_map = build_global_speaker_to_person_map(annotated_tracks, raw_results["segments"], fps=25.0)
-    diar_for_subs = apply_global_mapping_to_segments(raw_results["segments"], speaker_map)
-    # Persist for inspection (pure Person_* identities per diarization speaker)
+    # Important: use original annotated_tracks with absolute frame indices for mapping.
+    # Resampled tracks (0..T-1) lose absolute timing and break alignment with diarization.
+    diar_for_subs = split_segments_by_positive_fill(
+        annotated_tracks,
+        scores,
+        raw_results["segments"],
+        fps=25.0,
+        min_run_frames=6,
+    )
+    if not diar_for_subs:
+        raise RuntimeError("Framewise argmax mapping produced no segments; aborting to avoid empty subtitles.")
+    # Persist for inspection
     with open(matched_diarization_path, 'wb') as fil:
         pickle.dump(diar_for_subs, fil)
-    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Global overlap mapping diarization saved in %s \r\n" %args.pyworkPath)
+    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Positive-fill diarization saved in %s \r\n" %args.pyworkPath)
 
     # Visualization, save the result as the new video    
     # Build word list for word-timed subtitles
