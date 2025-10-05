@@ -57,6 +57,8 @@ parser.add_argument('--idBatch',              type=int,   default=64,   help='Ba
 parser.add_argument('--asdBatch',             type=int,   default=64,   help='Batch size for ASD window inference')
 parser.add_argument('--cropWorkers',          type=int,   default=8,    help='Parallel workers for audio cut + mux per track')
 parser.add_argument('--sceneWorkers',         type=int,   default=6,    help='Parallel workers for in-memory ASD by scene')
+parser.add_argument('--sam2_memory_num_maskmem', type=int, default=7,   help='Memory-bank size for overlay (SAM2-style): 1 cond + (num_maskmem-1) non-cond frames')
+parser.add_argument('--sam2_memory_stride',     type=int, default=1,   help='Temporal stride for non-conditioning memory frames in overlay')
 parser.add_argument('--sceneMinSec',         type=float, default=1.0,  help='Minimum scene length in seconds (detector min_scene_len)')
 
 args, unknown  = parser.parse_known_args()
@@ -1121,6 +1123,42 @@ def visualization(tracks, scores, args):
             colors[ident] = (int(b * 255), int(g * 255), int(r * 255))
         return colors
     ID_COLORS = _id_color_map(tracks)
+
+    # Load memory bank mapping for overlay (required; no fallback)
+    mb_path = os.path.join(args.pyworkPath, 'sam2_memory_bank.pckl')
+    if not os.path.isfile(mb_path):
+        raise FileNotFoundError(f"Missing memory bank file for visualization: {mb_path}")
+    with open(mb_path, 'rb') as f:
+        memory_bank = pickle.load(f)
+    if not isinstance(memory_bank, dict):
+        raise RuntimeError("Loaded memory bank has invalid format (expected dict)")
+
+    # Thumbnail cache and layout (use flist images)
+    thumb_cache = {}
+    tile_w = max(1, min(160, fw // 8))
+    tile_h = tile_w
+    margin = 6
+    label_height = 28
+
+    def get_thumb_from_flist(frame_index: int):
+        if frame_index in thumb_cache:
+            return thumb_cache[frame_index]
+        if frame_index < 0 or frame_index >= len(flist):
+            return None
+        img = cv2.imread(flist[frame_index])
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        side = min(h, w)
+        y0 = (h - side) // 2
+        x0 = (w - side) // 2
+        crop = img[y0:y0+side, x0:x0+side]
+        if crop.size == 0:
+            return None
+        thumb = cv2.resize(crop, (tile_w, tile_h))
+        thumb_cache[frame_index] = thumb
+        return thumb
+
     for fidx, fname in tqdm.tqdm(enumerate(flist), total = len(flist)):
         image = cv2.imread(fname)
         for face in faces[fidx]:
@@ -1133,6 +1171,33 @@ def visualization(tracks, scores, args):
             if isinstance(ident, str) and ident != 'None':
                 label = ident + (" (speaking)" if face['score'] > 0 else "")
                 cv2.putText(image, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
+
+        # Bottom-left Memory Bank overlay
+        mem_frames = memory_bank.get(fidx, [])
+        if mem_frames:
+            max_cols = max(1, min(6, len(mem_frames)))
+            rows = 1 if len(mem_frames) <= max_cols else 2
+            cols = max_cols if rows == 1 else int(math.ceil(len(mem_frames) / 2.0))
+            limit = rows * cols
+            block_w = cols * tile_w + (cols - 1) * margin
+            block_h = rows * tile_h + (rows - 1) * margin + label_height
+            y0 = max(0, fh - block_h - 10)
+            x0 = 10
+            cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
+            cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+            start_y = y0 + label_height
+            for idx_m, gf in enumerate(mem_frames[:limit]):
+                r = idx_m // cols
+                c = idx_m % cols
+                ty = start_y + r * (tile_h + margin)
+                tx = x0 + c * (tile_w + margin)
+                thumb = get_thumb_from_flist(int(gf))
+                if thumb is None:
+                    continue
+                h_t, w_t = thumb.shape[:2]
+                if ty + h_t <= fh and tx + w_t <= fw:
+                    image[ty:ty+h_t, tx:tx+w_t] = thumb
+                    cv2.rectangle(image, (tx, ty), (tx + w_t, ty + h_t), (120, 120, 120), 1)
         vOut.write(image)
     vOut.release()
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
@@ -1467,6 +1532,91 @@ def autofill_and_correct_matches(matched_results):
             result['identity'] = speaker_most_common_identity[speaker]
 
     return matched_results
+
+def _aggregate_overlap_counts_by_speaker(annotated_tracks, raw_segments, fps: float = 25.0):
+    """Aggregate visual overlap frame counts per diarization speaker vs Person_* identity.
+
+    Does NOT use ASD; counts number of track frames that fall inside the diarization
+    speaker's time ranges. Returns dict: speaker -> {identity -> count}.
+    """
+    from collections import defaultdict
+    import bisect
+    counts = defaultdict(lambda: defaultdict(int))
+    for diar in raw_segments:
+        if 'speaker' not in diar:
+            continue
+        s = float(diar.get('start', diar.get('start_time', 0.0)))
+        e = float(diar.get('end', diar.get('end_time', s)))
+        if e <= s:
+            continue
+        ds = int(s * float(fps)); de = int(e * float(fps))
+        spk = diar['speaker']
+        for tr in annotated_tracks:
+            ident = tr.get('identity', None)
+            if not (isinstance(ident, str) and ident not in (None, 'None')):
+                continue
+            frames = tr['track']['frame'] if 'track' in tr and 'frame' in tr['track'] else None
+            if frames is None:
+                continue
+            fr_list = frames.tolist() if hasattr(frames, 'tolist') else list(frames)
+            if not fr_list:
+                continue
+            t0 = int(fr_list[0]); t1 = int(fr_list[-1])
+            a = max(t0, ds); b = min(t1, de)
+            if a >= b:
+                continue
+            # count frames f in [a, b]
+            lo = bisect.bisect_left(fr_list, a)
+            hi = bisect.bisect_right(fr_list, b)
+            c = max(0, hi - lo)
+            if c > 0:
+                counts[spk][ident] += int(c)
+    return counts
+
+def build_global_speaker_to_person_map(annotated_tracks, raw_segments, fps: float = 25.0):
+    """Return a dict mapping each diarization speaker (e.g., SPEAKER_01) to a Person_* identity.
+
+    - Uses aggregated visual overlap counts over all segments of the speaker (no ASD).
+    - If a speaker has no positive energy for any Person_*, raises RuntimeError (no fallback).
+    """
+    counts = _aggregate_overlap_counts_by_speaker(annotated_tracks, raw_segments, fps=fps)
+    mapping = {}
+    for spk, c_map in counts.items():
+        if not c_map:
+            raise RuntimeError(f"No overlapping frames found for speaker {spk}; cannot map to Person_* without fallback.")
+        # Choose identity with maximum overlap count
+        ident, val = max(c_map.items(), key=lambda x: x[1])
+        if int(val) <= 0:
+            raise RuntimeError(f"Non-positive overlap for speaker {spk}; refusing to map with zero evidence.")
+        mapping[spk] = ident
+    # Ensure all speakers present in diarization are covered
+    spk_all = [seg.get('speaker') for seg in raw_segments if 'speaker' in seg]
+    for sp in set(spk_all):
+        if sp not in mapping:
+            raise RuntimeError(f"Missing mapping for diarization speaker {sp}; no ASD-supported Person_* found.")
+    return mapping
+
+def apply_global_mapping_to_segments(raw_segments, speaker_to_person_map):
+    """Build per-segment Person_* assignments using a global speaker->Person_* map.
+
+    Returns list of {'start','end','identity','text'}.
+    """
+    out = []
+    for seg in raw_segments:
+        s = float(seg.get('start', seg.get('start_time', 0.0)))
+        e = float(seg.get('end', seg.get('end_time', s)))
+        if e <= s:
+            continue
+        spk = seg.get('speaker')
+        if spk not in speaker_to_person_map:
+            raise RuntimeError(f"No mapping for segment speaker {spk} in global map.")
+        out.append({
+            'start': s,
+            'end': e,
+            'identity': speaker_to_person_map[spk],
+            'text': seg.get('text', ''),
+        })
+    return out
 
 def _global_top_identity_by_asd(annotated_tracks, scores):
     id_speaking = {}
@@ -2224,6 +2374,51 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
 
     ID_COLORS = _id_color_map(tracks)
 
+    # Load memory bank mapping for overlay (required; no fallback)
+    mb_path = os.path.join(args.pyworkPath, 'sam2_memory_bank.pckl')
+    if not os.path.isfile(mb_path):
+        raise FileNotFoundError(f"Missing memory bank file for visualization: {mb_path}")
+    with open(mb_path, 'rb') as f:
+        memory_bank = pickle.load(f)
+    if not isinstance(memory_bank, dict):
+        raise RuntimeError("Loaded memory bank has invalid format (expected dict)")
+
+    # Prepare a second capture for random access to memory frames
+    cap_mem = cv2.VideoCapture(args.videoFilePath)
+    if not cap_mem.isOpened():
+        raise RuntimeError(f"Failed to open video for memory overlay: {args.videoFilePath}")
+
+    # Thumbnail cache and layout
+    thumb_cache = {}
+    thumb_order = []
+    THUMB_CAP = 500
+    tile_w = max(1, min(160, fw // 8))
+    tile_h = tile_w
+    margin = 6
+    label_height = 28
+
+    def get_thumb(frame_index: int):
+        if frame_index in thumb_cache:
+            return thumb_cache[frame_index]
+        cap_mem.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ret, img = cap_mem.read()
+        if not ret or img is None:
+            return None
+        h, w = img.shape[:2]
+        side = min(h, w)
+        y0 = (h - side) // 2
+        x0 = (w - side) // 2
+        crop = img[y0:y0+side, x0:x0+side]
+        if crop.size == 0:
+            return None
+        thumb = cv2.resize(crop, (tile_w, tile_h))
+        thumb_cache[frame_index] = thumb
+        thumb_order.append(frame_index)
+        if len(thumb_order) > THUMB_CAP:
+            old = thumb_order.pop(0)
+            thumb_cache.pop(old, None)
+        return thumb
+
     cap = cv2.VideoCapture(args.videoFilePath)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video for visualization pass: {args.videoFilePath}")
@@ -2248,9 +2443,39 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
                 cv2.putText(image, label,
                             (bbox_x, max(0, bbox_y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1,
                             color, 3)
+        # Bottom-left Memory Bank overlay
+        mem_frames = memory_bank.get(fidx, [])
+        if mem_frames:
+            max_cols = max(1, min(6, len(mem_frames)))
+            rows = 1 if len(mem_frames) <= max_cols else 2
+            cols = max_cols if rows == 1 else int(math.ceil(len(mem_frames) / 2.0))
+            limit = rows * cols
+            block_w = cols * tile_w + (cols - 1) * margin
+            block_h = rows * tile_h + (rows - 1) * margin + label_height
+            y0 = max(0, fh - block_h - 10)
+            x0 = 10
+            cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
+            cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+            start_y = y0 + label_height
+            for idx_m, gf in enumerate(mem_frames[:limit]):
+                r = idx_m // cols
+                c = idx_m % cols
+                ty = start_y + r * (tile_h + margin)
+                tx = x0 + c * (tile_w + margin)
+                if gf < 0:
+                    continue
+                thumb = get_thumb(int(gf))
+                if thumb is None:
+                    continue
+                h_t, w_t = thumb.shape[:2]
+                if ty + h_t <= fh and tx + w_t <= fw:
+                    image[ty:ty+h_t, tx:tx+w_t] = thumb
+                    cv2.rectangle(image, (tx, ty), (tx + w_t, ty + h_t), (120, 120, 120), 1)
+
         vOut.write(image)
         fidx += 1
     cap.release()
+    cap_mem.release()
     vOut.release()
 
     # Generate ASS subtitles and merge variants
@@ -2638,29 +2863,14 @@ def process_video():
             pickle.dump(raw_results["segments"], fil)
         sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Raw diarization extracted and saved in %s \r\n" %args.pyworkPath)
 
-    # Match speaker identity and correct results
+    # Build a simple global mapping: diarization speaker -> Person_* using visual overlap counts only
     matched_diarization_path = os.path.join(args.pyworkPath, 'matched_diriazation.pckl')
-    # Rebuild diarization purely with visual identities + ASD; ignore diarization speakers
-    if not hasattr(args, 'videoFps') or args.videoFps is None or args.videoFps <= 0:
-        raise RuntimeError("Missing or invalid args.videoFps; cannot align ASD intervals.")
-    vis_diar_results = rebuild_segments_with_visual_asd(
-        annotated_tracks, scores, raw_results["segments"], fps=25.0,
-        tau=0.2, min_seg=0.15, merge_gap=0.10
-    )
-    # Smooth identity flicker (A-B-A) for readability
-    vis_diar_results = _smooth_person_segments(vis_diar_results, max_flip_dur=0.6)
-    # Additionally, produce a fully Person-mapped diarization from raw segments using ASD overlap
-    # Use original annotated_tracks (with absolute frame indices) for robust overlap mapping
-    person_mapped = map_segments_to_person(annotated_tracks, scores, raw_results["segments"], fps=25)
-    # Choose the richer source for subtitles: prefer person_mapped (guaranteed Person_*),
-    # fallback to vis_diar_results if person_mapped became empty under strictness.
-    # Prefer visual+ASD rebuilt segments for better per-person boundary accuracy
-    diar_for_subs = vis_diar_results if vis_diar_results else person_mapped
-    diar_for_subs = _smooth_person_segments(diar_for_subs, max_flip_dur=0.6)
-    # Persist for inspection
+    speaker_map = build_global_speaker_to_person_map(annotated_tracks, raw_results["segments"], fps=25.0)
+    diar_for_subs = apply_global_mapping_to_segments(raw_results["segments"], speaker_map)
+    # Persist for inspection (pure Person_* identities per diarization speaker)
     with open(matched_diarization_path, 'wb') as fil:
         pickle.dump(diar_for_subs, fil)
-    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Visual-ASD diarization (person-mapped) saved in %s \r\n" %args.pyworkPath)
+    sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Global overlap mapping diarization saved in %s \r\n" %args.pyworkPath)
 
     # Visualization, save the result as the new video    
     # Build word list for word-timed subtitles
