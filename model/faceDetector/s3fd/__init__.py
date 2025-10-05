@@ -65,3 +65,62 @@ class S3FD():
             bboxes = bboxes[keep]
 
         return bboxes
+
+    def detect_faces_batch(self, images, conf_th=0.8, scales=[1]):
+        """Batch face detection for a list of RGB images.
+
+        Args:
+            images: list[np.ndarray HxWx3 RGB]
+            conf_th: confidence threshold
+            scales: list of scale factors (same meaning as single-image path)
+
+        Returns:
+            list of np.ndarray of shape (N_i, 5) per image, where columns are (x1,y1,x2,y2,score).
+        """
+        if not images:
+            return []
+        # Original unscaled sizes per image
+        sizes = [(img.shape[1], img.shape[0]) for img in images]
+
+        # Accumulate boxes per image over all scales, then NMS per image
+        per_image_boxes = [np.empty((0, 5), dtype=np.float32) for _ in images]
+
+        with torch.no_grad():
+            for s in scales:
+                # Preprocess batch for this scale, match single-image code exactly
+                batch = []
+                for img in images:
+                    scaled_img = cv2.resize(img, dsize=(0, 0), fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
+                    scaled_img = np.swapaxes(scaled_img, 1, 2)
+                    scaled_img = np.swapaxes(scaled_img, 1, 0)
+                    scaled_img = scaled_img[[2, 1, 0], :, :]
+                    scaled_img = scaled_img.astype('float32')
+                    scaled_img -= img_mean
+                    scaled_img = scaled_img[[2, 1, 0], :, :]
+                    batch.append(scaled_img)
+                x = torch.from_numpy(np.stack(batch, axis=0)).to(self.device)
+                y = self.net(x)
+                detections = y.data  # (B, num_classes, top_k, 5)
+
+                for b, (w, h) in enumerate(sizes):
+                    scale_vec = torch.Tensor([w, h, w, h]).to(detections.device)
+                    # Collect detections for all classes like single-image path
+                    for i in range(detections.size(1)):
+                        j = 0
+                        # detections[b, i, j, 0] is score
+                        while j < detections.size(2) and detections[b, i, j, 0] > conf_th:
+                            score = float(detections[b, i, j, 0].item())
+                            pt = (detections[b, i, j, 1:] * scale_vec).detach().cpu().numpy()
+                            bbox = (pt[0], pt[1], pt[2], pt[3], score)
+                            per_image_boxes[b] = np.vstack((per_image_boxes[b], bbox))
+                            j += 1
+
+        # NMS per image
+        out = []
+        for boxes in per_image_boxes:
+            if boxes.size == 0:
+                out.append(boxes)
+            else:
+                keep = nms_(boxes, 0.1)
+                out.append(boxes[keep])
+        return out

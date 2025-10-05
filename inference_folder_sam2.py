@@ -57,6 +57,7 @@ if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
     subprocess.call(cmd, shell=True, stdout=None)
     
 from sam2.sam2.build_sam import build_sam2_video_predictor
+from sam2.sam2.modeling.sam2_utils import select_closest_cond_frames
 
 # Use repo-local SAM2 assets and Hydra config name (not absolute path)
 sam2_checkpoint = os.path.join(_THIS_DIR, 'sam2', 'checkpoints', 'sam2.1_hiera_small.pt')
@@ -114,6 +115,10 @@ def inference_video(args, scene):
     base_shot_dir = os.path.join(args.pyworkPath, 'sam2_shots')
     os.makedirs(base_shot_dir, exist_ok=True)
 
+    # For visualization: record memory bank (per global frame) used by SAM2
+    # Structure: {global_frame_index: [global_frame_indices_used_as_memory]}
+    memory_bank = {}
+
     for shot in scene:
         shot_start, shot_end = shot[0].get_frames(), shot[1].get_frames()
         shot_frames = flist[shot_start:shot_end + 1]
@@ -169,6 +174,48 @@ def inference_video(args, scene):
                 for i, out_obj_id in enumerate(out_obj_ids)
             }
 
+            # Compute memory bank frames used at this frame (local indices in this shot)
+            try:
+                num_frames_local = inference_state.get("num_frames", len(shot_frames))
+                # For every object, collect cond and non-cond memory frames per SAM2 logic
+                per_obj_mem_frames = []
+                for obj_idx, obj_output_dict in inference_state["output_dict_per_obj"].items():
+                    # Conditioning frames selection (closest in time)
+                    cond_outputs = obj_output_dict["cond_frame_outputs"]
+                    selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
+                        out_frame_idx, cond_outputs, SAM2.max_cond_frames_in_attn
+                    )
+                    mem_frames = list(sorted(selected_cond_outputs.keys()))  # t_pos = 0
+                    # Non-conditioning memory frames (t_pos = 1..num_maskmem-1)
+                    stride = SAM2.memory_temporal_stride_for_eval
+                    for t_pos in range(1, SAM2.num_maskmem):
+                        t_rel = SAM2.num_maskmem - t_pos
+                        if t_rel == 1:
+                            prev_frame_idx = out_frame_idx - 1
+                        else:
+                            prev_frame_idx = ((out_frame_idx - 2) // stride) * stride
+                            prev_frame_idx = prev_frame_idx - (t_rel - 2) * stride
+                        if prev_frame_idx < 0 or prev_frame_idx >= num_frames_local:
+                            continue
+                        out_prev = obj_output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+                        if out_prev is None:
+                            out_prev = unselected_cond_outputs.get(prev_frame_idx, None)
+                        if out_prev is not None:
+                            mem_frames.append(prev_frame_idx)
+                    per_obj_mem_frames.append(set(mem_frames))
+
+                # Union across objects and map to global frame indices
+                if per_obj_mem_frames:
+                    union_local = sorted(set().union(*per_obj_mem_frames))
+                else:
+                    union_local = []
+                global_frame = shot_start + out_frame_idx
+                global_mem = [shot_start + lf for lf in union_local]
+                memory_bank[global_frame] = global_mem
+            except Exception as e:
+                # Do not mask errors silently: expose precise failures for debugging
+                raise RuntimeError(f"Failed to compute memory bank at local frame {out_frame_idx}: {e}")
+
         for fidx in range(shot_start, shot_end + 1):
             frame_dets = []
             local_idx = fidx - shot_start
@@ -190,6 +237,11 @@ def inference_video(args, scene):
     savePath = os.path.join(args.pyworkPath, 'faces_sam2.pckl')
     with open(savePath, 'wb') as fil:
         pickle.dump(dets, fil)
+
+    # Persist memory bank mapping for the whole episode
+    mb_path = os.path.join(args.pyworkPath, 'sam2_memory_bank.pckl')
+    with open(mb_path, 'wb') as fil:
+        pickle.dump(memory_bank, fil)
 
     return dets
 
@@ -543,6 +595,23 @@ def visualization(tracks, scores, diarization_results, args):
     GREEN_BGR = (81, 208, 146)
     RED_BGR = (60, 58, 219)
 
+    # Load memory bank mapping (required for memory overlay)
+    mb_path = os.path.join(args.pyworkPath, 'sam2_memory_bank.pckl')
+    if not os.path.isfile(mb_path):
+        raise FileNotFoundError(f"Missing memory bank file for visualization: {mb_path}")
+    with open(mb_path, 'rb') as f:
+        memory_bank = pickle.load(f)
+    if not isinstance(memory_bank, dict):
+        raise RuntimeError("Loaded memory bank has invalid format (expected dict)")
+
+    # Cache thumbnails to avoid repeated disk reads
+    thumb_cache = {}
+    # Thumbnail layout config
+    tile_w = max(1, min(160, fw // 8))
+    tile_h = tile_w  # square thumbnails
+    margin = 6
+    label_height = 28
+
     for fidx, fname in tqdm.tqdm(enumerate(flist), total=len(flist)):
         image = cv2.imread(fname)
 
@@ -564,6 +633,49 @@ def visualization(tracks, scores, diarization_results, args):
             cv2.putText(image, txt,
                         (bbox_x, bbox_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1,
                         color, 3)
+
+        # Bottom-left memory bank overlay
+        mem_frames = memory_bank.get(fidx, [])
+        if mem_frames:
+            # Determine grid size (max 2 rows)
+            max_cols = max(1, min(6, len(mem_frames)))
+            rows = 1 if len(mem_frames) <= max_cols else 2
+            cols = max_cols if rows == 1 else int(math.ceil(len(mem_frames) / 2.0))
+            block_w = cols * tile_w + (cols - 1) * margin
+            block_h = rows * tile_h + (rows - 1) * margin + label_height
+            # Background panel
+            y0 = fh - block_h - 10
+            x0 = 10
+            y0 = max(0, y0)
+            cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
+            cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+
+            # Draw thumbnails
+            start_y = y0 + label_height
+            for idx_m, gf in enumerate(mem_frames):
+                r = idx_m // cols
+                c = idx_m % cols
+                ty = start_y + r * (tile_h + margin)
+                tx = x0 + c * (tile_w + margin)
+                # Bounds check
+                if gf < 0 or gf >= len(flist):
+                    continue
+                # Load and cache thumb
+                if gf not in thumb_cache:
+                    img_m = cv2.imread(flist[gf])
+                    if img_m is None:
+                        continue
+                    # center-crop to square then resize
+                    h_m, w_m = img_m.shape[:2]
+                    side = min(h_m, w_m)
+                    y_c = (h_m - side) // 2
+                    x_c = (w_m - side) // 2
+                    img_m = img_m[y_c:y_c+side, x_c:x_c+side]
+                    img_m = cv2.resize(img_m, (tile_w, tile_h))
+                    thumb_cache[gf] = img_m
+                image[ty:ty+tile_h, tx:tx+tile_w] = thumb_cache[gf]
+                # small border to separate
+                cv2.rectangle(image, (tx, ty), (tx + tile_w, ty + tile_h), (120, 120, 120), 1)
 
         vOut.write(image)
 

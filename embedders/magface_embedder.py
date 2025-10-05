@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Speed up ONNX Runtime + CUDA initialization to reduce first-run stalls
+os.environ.setdefault('ORT_CUDNN_CONV_ALGO_SEARCH', 'DEFAULT')  # avoid EXHAUSTIVE search
+os.environ.setdefault('CUDA_MODULE_LOADING', 'LAZY')            # lazy CUDA module loading
+
 
 # ------------------------------
 # iResNet (from official MagFace repo, abridged for inference)
@@ -187,10 +191,24 @@ class MagFaceEmbedder:
             raise RuntimeError(
                 'insightface is required for MagFace alignment. Install it or set IDENTITY_EMBEDDER=facenet.'
             ) from e
-        self.fa = FaceAnalysis(name='buffalo_l')
+        # Restrict modules to essentials to avoid unnecessary model loads
+        self.fa = FaceAnalysis(name='buffalo_l', allowed_modules=['detection','landmark_2d_106','recognition'])
         ctx_id = 0 if self.device.type == 'cuda' else -1
-        # Smaller det_size suffices for cropped tracks
-        self.fa.prepare(ctx_id=ctx_id, det_size=(224, 224))
+        # Allow overriding detection input size for faster alignment via env MAGFACE_DET_SIZE (e.g., 160x160)
+        det_env = os.environ.get('MAGFACE_DET_SIZE', '').strip()
+        det_size = (224, 224)
+        if det_env:
+            try:
+                if 'x' in det_env.lower():
+                    w, h = det_env.lower().split('x')
+                elif ',' in det_env:
+                    w, h = det_env.split(',')
+                else:
+                    w = h = det_env
+                det_size = (int(w), int(h))
+            except Exception:
+                det_size = (224, 224)
+        self.fa.prepare(ctx_id=ctx_id, det_size=det_size)
         # ArcFace 112x112 5-point template
         self.dst5 = np.array(
             [
@@ -377,6 +395,44 @@ class MagFaceEmbedder:
         emb = F.normalize(emb, p=2, dim=1)
         return emb
 
+    @torch.no_grad()
+    def track_embedding_from_frames(self, frames_bgr: List[np.ndarray], active_indices: Optional[List[int]] = None, max_samples: int = 15) -> Optional[torch.Tensor]:
+        if not frames_bgr:
+            return None
+        # Select indices
+        total = len(frames_bgr)
+        if active_indices and len(active_indices) > 0:
+            idx = sorted(set(int(min(max(0, i), total - 1)) for i in active_indices))
+            if len(idx) > max_samples:
+                step = max(1, len(idx) // max_samples)
+                idx = idx[::step][:max_samples]
+        else:
+            idx = [0, total // 4, total // 2, (3 * total) // 4, max(0, total - 1)]
+        tensors = []
+        for i in idx:
+            frame = frames_bgr[i]
+            t = self._align_and_preprocess(frame)
+            if t is not None:
+                tensors.append(t)
+        if not tensors:
+            return None
+        feats = []
+        mags = []
+        for j in range(0, len(tensors), self.batch_size):
+            batch = torch.stack(tensors[j : j + self.batch_size], dim=0).to(self.device)
+            out = self.model(batch)
+            mag = torch.norm(out, p=2, dim=1)
+            out_n = F.normalize(out, p=2, dim=1)
+            feats.append(out_n)
+            mags.append(mag)
+        Fcat = torch.cat(feats, dim=0)
+        Mcat = torch.cat(mags, dim=0)
+        if Fcat.size(0) == 0:
+            return None
+        w = Mcat.view(-1, 1)
+        emb = (Fcat * w).sum(dim=0, keepdim=True) / (w.sum() + 1e-8)
+        emb = F.normalize(emb, p=2, dim=1)
+        return emb
     @torch.no_grad()
     def frame_embeddings(
         self,

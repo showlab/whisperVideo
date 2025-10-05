@@ -111,6 +111,46 @@ class IdentityVerifier:
         return emb
 
     @torch.no_grad()
+    def track_embedding_from_frames(self, frames_bgr, active_indices=None, max_samples: int = 15):
+        if not frames_bgr:
+            return None
+        total = len(frames_bgr)
+        if active_indices and len(active_indices) > 0:
+            idx = sorted(set(int(min(max(0, i), total - 1)) for i in active_indices))
+            if len(idx) > max_samples:
+                step = max(1, len(idx) // max_samples)
+                idx = idx[::step][:max_samples]
+        else:
+            idx = [0, total // 4, total // 2, (3 * total) // 4, max(0, total - 1)]
+        tensors = []
+        for i in idx:
+            frame = frames_bgr[i]
+            t = self.preprocess_frame(frame)
+            if t is not None:
+                tensors.append(t)
+        if not tensors:
+            return None
+        embeds_all = []
+        mags_all = []
+        for i in range(0, len(tensors), self.batch_size):
+            batch = torch.stack(tensors[i:i + self.batch_size], dim=0).to(self.device)
+            out = self.model(batch)
+            mag = torch.norm(out, p=2, dim=1)
+            out_n = F.normalize(out, p=2, dim=1)
+            embeds_all.append(out_n)
+            mags_all.append(mag)
+        if not embeds_all:
+            return None
+        E = torch.cat(embeds_all, dim=0)
+        M = torch.cat(mags_all, dim=0)
+        if E.size(0) == 0:
+            return None
+        w = M.view(-1, 1)
+        emb = (E * w).sum(dim=0, keepdim=True) / (w.sum() + 1e-8)
+        emb = F.normalize(emb, p=2, dim=1)
+        return emb
+
+    @torch.no_grad()
     def frame_embeddings(self, track_file, active_indices=None, max_samples: int = 15, top_k: int = None):
         """Return per-frame embeddings (L2-normalized) and raw magnitudes.
 
