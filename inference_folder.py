@@ -1184,22 +1184,76 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
     batch_size = 32 # reduce if low on GPU mem
     compute_type = "int8"  # use int8 for lower memory with large model
 
-    # 1. Transcribe with specified Whisper model (default: Chinese BELLE-2)
-    #    Set env WHISPERX_MODEL to override (e.g., "large-v3", "large-v2", or HF repo id)
-    model_name = os.environ.get("WHISPERX_MODEL", "BELLE-2/Belle-whisper-large-v3-zh").strip()
-    if not model_name:
-        model_name = "BELLE-2/Belle-whisper-large-v3-zh"
-    model = whisperx.load_model(model_name, device, compute_type=compute_type)
+    # 1. Transcribe
+    # Choose between whisperx internal loader and transformers pipeline (e.g., BELLE-2)
+    model_name = os.environ.get("WHISPERX_MODEL", "").strip() or "large-v3"
+    use_tf = os.environ.get("USE_TRANSFORMERS_ASR", "").strip().lower() in ("1","true","yes") \
+             or model_name.startswith("BELLE-2/")
 
-    audio = whisperx.load_audio(audio_file)
-    result = model.transcribe(audio, batch_size=batch_size)
-    print(result["segments"]) # before alignment
+    if use_tf:
+        try:
+            from transformers import pipeline as hf_pipeline
+        except Exception as e:
+            raise RuntimeError("Transformers not available but USE_TRANSFORMERS_ASR requested") from e
+        dev_idx = 0 if device == "cuda" else -1
+        asr = hf_pipeline(
+            "automatic-speech-recognition",
+            model=(model_name if model_name else "BELLE-2/Belle-whisper-large-v3-zh"),
+            device=dev_idx,
+            chunk_length_s=30,
+            stride_length_s=6,
+        )
+        # Force Chinese transcribe mode as per BELLE docs
+        try:
+            asr.model.config.forced_decoder_ids = (
+                asr.tokenizer.get_decoder_prompt_ids(language="zh", task="transcribe")
+            )
+        except Exception:
+            pass
+        # Run transcription with timestamps
+        out = asr(audio_file, return_timestamps=True)
+        # Expect 'chunks' with {'timestamp':(s,e), 'text':...}
+        chunks = out.get("chunks", []) if isinstance(out, dict) else []
+        if not chunks:
+            raise RuntimeError("Transformers ASR returned no chunks with timestamps; cannot proceed")
+        segments = []
+        for ch in chunks:
+            ts = ch.get("timestamp", None)
+            txt = str(ch.get("text", "")).strip()
+            if not isinstance(ts, (list, tuple)) or len(ts) != 2:
+                continue
+            s, e = ts
+            if s is None or e is None:
+                continue
+            s = float(s); e = float(e)
+            if e <= s:
+                continue
+            if not txt:
+                continue
+            segments.append({"start": s, "end": e, "text": txt})
+        if not segments:
+            raise RuntimeError("No valid timestamped segments parsed from Transformers ASR output")
+        result = {"segments": segments, "language": "zh"}
+        audio = whisperx.load_audio(audio_file)  # used by alignment/diarization
+        # 2) Optional: align words via whisperx to enrich segments with 'words'
+        try:
+            model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
+            result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
+        except Exception as e:
+            # If alignment model is unavailable, proceed without words (downstream handles gracefully)
+            pass
+        print(result.get("segments", []))
+    else:
+        # WhisperX internal loader (faster-whisper / ct2)
+        model = whisperx.load_model(model_name, device, compute_type=compute_type)
+        audio = whisperx.load_audio(audio_file)
+        result = model.transcribe(audio, batch_size=batch_size)
+        print(result.get("segments", []))  # before alignment
+        # 2. Align whisper output
+        model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
+        result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
 
-    # 2. Align whisper output
-    model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
-    result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
-
-    print(result["segments"]) # after alignment
+    print(result["segments"]) # segments after ASR (+optional alignment)
 
     # 3. Assign speaker labels
     # Read HuggingFace token from environment
