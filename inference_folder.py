@@ -1122,6 +1122,187 @@ def visualization(tracks, scores, args):
         return colors
     ID_COLORS = _id_color_map(tracks)
 
+    # Prepare diarization segments per identity for speech bubbles (right/left balloons)
+    segs_by_ident = defaultdict(list)
+    if isinstance(diarization_results, list):
+        for seg in diarization_results:
+            ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+            if not (isinstance(ident, str) and ident not in (None, 'None')):
+                continue
+            s = float(seg.get('start', seg.get('start_time', 0.0)))
+            e = float(seg.get('end', seg.get('end_time', s)))
+            if e <= s:
+                continue
+            txt = str(seg.get('text', ''))
+            segs_by_ident[ident].append((s, e, txt))
+        for k in segs_by_ident:
+            segs_by_ident[k].sort(key=lambda x: (x[0], x[1]))
+
+    def _bubble_text_for(ident: str, t_sec: float) -> str:
+        lst = segs_by_ident.get(ident, [])
+        for (s, e, txt) in lst:
+            if s <= t_sec <= e:
+                return txt
+        return ''
+
+    def _wrap_lines(txt: str, max_cn: int = 16, max_lat: int = 24, max_lines: int = 3):
+        wrapped = _wrap_text_for_ass(txt, max_cn, max_lat)
+        lines = [ln for ln in wrapped.split('\\N') if ln.strip()]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            if lines and not lines[-1].endswith('…'):
+                lines[-1] = lines[-1] + '…'
+        return lines
+
+    def _draw_rounded_rect(img, x, y, w, h, radius, fill_color, border_color, border_th=2, alpha=0.9):
+        x = int(x); y = int(y); w = int(w); h = int(h); radius = int(max(2, radius))
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x+radius, y), (x+w-radius, y+h), fill_color, thickness=-1)
+        cv2.rectangle(overlay, (x, y+radius), (x+w, y+h-radius), fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.rectangle(img, (x+radius, y), (x+w-radius, y+h), border_color, thickness=border_th)
+        cv2.rectangle(img, (x, y+radius), (x+w, y+h-radius), border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+h-radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+h-radius), radius, border_color, thickness=border_th)
+
+    def _draw_tail(img, base_x, base_y, to_left: bool, fill_color, border_color, tail_len=14, tail_half=8, alpha=0.9, border_th=2):
+        base_x = int(base_x); base_y = int(base_y)
+        if to_left:
+            pts = np.array([[base_x, base_y], [base_x+tail_len, base_y-tail_half], [base_x+tail_len, base_y+tail_half]], dtype=np.int32)
+        else:
+            pts = np.array([[base_x, base_y], [base_x-tail_len, base_y-tail_half], [base_x-tail_len, base_y+tail_half]], dtype=np.int32)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], fill_color)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.polylines(img, [pts], isClosed=True, color=border_color, thickness=border_th)
+
+    # Prepare diarization segments per identity for speech bubbles
+    segs_by_ident = defaultdict(list)
+    if isinstance(diarization_results, list):
+        for seg in diarization_results:
+            ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+            if not (isinstance(ident, str) and ident not in (None, 'None')):
+                continue
+            s = float(seg.get('start', seg.get('start_time', 0.0)))
+            e = float(seg.get('end', seg.get('end_time', s)))
+            if e <= s:
+                continue
+            txt = str(seg.get('text', ''))
+            segs_by_ident[ident].append((s, e, txt))
+        for k in segs_by_ident:
+            segs_by_ident[k].sort(key=lambda x: (x[0], x[1]))
+
+    def _bubble_text_for(ident: str, t_sec: float) -> str:
+        lst = segs_by_ident.get(ident, [])
+        for (s, e, txt) in lst:
+            if s <= t_sec <= e:
+                return txt
+        return ''
+
+    def _wrap_lines(txt: str, max_cn: int = 16, max_lat: int = 24, max_lines: int = 3):
+        wrapped = _wrap_text_for_ass(txt, max_cn, max_lat)
+        lines = [ln for ln in wrapped.split('\\N') if ln.strip()]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            if lines and not lines[-1].endswith('…'):
+                lines[-1] = lines[-1] + '…'
+        return lines
+
+    def _draw_rounded_rect(img, x, y, w, h, radius, fill_color, border_color, border_th=2, alpha=0.9):
+        x = int(x); y = int(y); w = int(w); h = int(h); radius = int(max(2, radius))
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x+radius, y), (x+w-radius, y+h), fill_color, thickness=-1)
+        cv2.rectangle(overlay, (x, y+radius), (x+w, y+h-radius), fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.rectangle(img, (x+radius, y), (x+w-radius, y+h), border_color, thickness=border_th)
+        cv2.rectangle(img, (x, y+radius), (x+w, y+h-radius), border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+h-radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+h-radius), radius, border_color, thickness=border_th)
+
+    def _draw_tail(img, base_x, base_y, to_left: bool, fill_color, border_color, tail_len=14, tail_half=8, alpha=0.9, border_th=2):
+        base_x = int(base_x); base_y = int(base_y)
+        if to_left:
+            pts = np.array([[base_x, base_y], [base_x+tail_len, base_y-tail_half], [base_x+tail_len, base_y+tail_half]], dtype=np.int32)
+        else:
+            pts = np.array([[base_x, base_y], [base_x-tail_len, base_y-tail_half], [base_x-tail_len, base_y+tail_half]], dtype=np.int32)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], fill_color)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.polylines(img, [pts], isClosed=True, color=border_color, thickness=border_th)
+
+    # Prepare diarization segments per identity for speech bubbles
+    segs_by_ident = defaultdict(list)
+    if isinstance(diarization_results, list):
+        for seg in diarization_results:
+            ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+            if not (isinstance(ident, str) and ident not in (None, 'None')):
+                continue
+            s = float(seg.get('start', seg.get('start_time', 0.0)))
+            e = float(seg.get('end', seg.get('end_time', s)))
+            if e <= s:
+                continue
+            txt = str(seg.get('text', ''))
+            segs_by_ident[ident].append((s, e, txt))
+        for k in segs_by_ident:
+            segs_by_ident[k].sort(key=lambda x: (x[0], x[1]))
+
+    def _bubble_text_for(ident: str, t_sec: float) -> str:
+        lst = segs_by_ident.get(ident, [])
+        for (s, e, txt) in lst:
+            if s <= t_sec <= e:
+                return txt
+        return ''
+
+    def _wrap_lines(txt: str, max_cn: int = 16, max_lat: int = 24, max_lines: int = 3):
+        wrapped = _wrap_text_for_ass(txt, max_cn, max_lat)
+        lines = [ln for ln in wrapped.split('\\N') if ln.strip()]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            if lines:
+                if not lines[-1].endswith('…'):
+                    lines[-1] = lines[-1] + '…'
+        return lines
+
+    def _draw_rounded_rect(img, x, y, w, h, radius, fill_color, border_color, border_th=2, alpha=0.9):
+        x = int(x); y = int(y); w = int(w); h = int(h); radius = int(max(2, radius))
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x+radius, y), (x+w-radius, y+h), fill_color, thickness=-1)
+        cv2.rectangle(overlay, (x, y+radius), (x+w, y+h-radius), fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.rectangle(img, (x+radius, y), (x+w-radius, y+h), border_color, thickness=border_th)
+        cv2.rectangle(img, (x, y+radius), (x+w, y+h-radius), border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+h-radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+h-radius), radius, border_color, thickness=border_th)
+
+    def _draw_tail(img, base_x, base_y, to_left: bool, fill_color, border_color, tail_len=14, tail_half=8, alpha=0.9, border_th=2):
+        base_x = int(base_x); base_y = int(base_y)
+        if to_left:
+            pts = np.array([[base_x, base_y], [base_x+tail_len, base_y-tail_half], [base_x+tail_len, base_y+tail_half]], dtype=np.int32)
+        else:
+            pts = np.array([[base_x, base_y], [base_x-tail_len, base_y-tail_half], [base_x-tail_len, base_y+tail_half]], dtype=np.int32)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], fill_color)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.polylines(img, [pts], isClosed=True, color=border_color, thickness=border_th)
+
     # Build memory ROI map from tracks: per frame f -> list of (mem_frame, x, y, s)
     M = 6
     stride = 1
@@ -2301,7 +2482,7 @@ def seconds_to_srt_time(seconds):
     milliseconds = int((seconds - int(seconds)) * 1000)
     return f"{int(hours):02}:{int(minutes):02}:{int(seconds):02},{milliseconds:03}"
 
-def _wrap_text_for_ass(text: str, max_chars_cn: int = 18, max_chars_lat: int = 28) -> str:
+def _wrap_text_for_ass(text: str, max_chars_cn: int = 16, max_chars_lat: int = 24) -> str:
     # Basic punctuation-aware wrapping: prefer breaking at sentence-ending punctuation, then spaces, otherwise hard-wrap.
     if not text:
         return ""
@@ -2496,6 +2677,7 @@ def generate_ass_seq(diarization_results, output_ass_path, id_colors_map, font_n
 
 def generate_ass_seq_wordtimed(diarization_results, output_ass_path, id_colors_map, font_name_override=None, words_list=None):
     # Build ASS using word-aligned timings per displayed line when words_list provided.
+    # Render at right side; do not show Person_* prefix; colorize text by identity.
     font_name = font_name_override or 'Noto Sans CJK SC'
     header = [
         "[Script Info]",
@@ -2508,7 +2690,7 @@ def generate_ass_seq_wordtimed(diarization_results, output_ass_path, id_colors_m
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Default,{font_name},42,&H00FFFFFF,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,2,0,2,30,30,30,1",
+        f"Style: Default,{font_name},40,&H00FFFFFF,&H000000FF,&H00202020,&H00000000,0,0,0,0,100,100,0,0,1,2,0,6,20,60,30,1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -2532,7 +2714,7 @@ def generate_ass_seq_wordtimed(diarization_results, output_ass_path, id_colors_m
         raw_text = str(seg.get('text', ''))
         color = id_colors_map.get(ident, id_colors_map.get(_normalize_identity_prefix(ident), (255,255,255)))
         ass_hex = _bgr_to_ass_hex(color)
-        prefix = f"{{\\c{ass_hex}}}{ident}{{\\c&HFFFFFF&}}: "
+        # No Person_* prefix
         if isinstance(words_list, list) and words_list:
             # collect words overlapping this segment
             toks = []
@@ -2549,7 +2731,7 @@ def generate_ass_seq_wordtimed(diarization_results, output_ass_path, id_colors_m
             if not toks:
                 wrapped = _wrap_text_for_ass(raw_text)
                 if wrapped.strip():
-                    lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(et)},Default,,0,0,0,,{prefix}{wrapped}")
+                    lines.append(f"Dialogue: 0,{_ass_time(st)},{_ass_time(et)},Default,,0,0,0,,{{\\c{ass_hex}}}{wrapped}")
                 continue
             # detect CJK
             has_cjk = any('\u4e00' <= ch <= '\u9fff' for _,_,w in toks for ch in w)
@@ -2571,7 +2753,7 @@ def generate_ass_seq_wordtimed(diarization_results, output_ass_path, id_colors_m
                     text_line = ' '.join(w for _,_,w in cur)
                 text_line = _wrap_text_for_ass(text_line)
                 if text_line.strip():
-                    lines.append(f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Default,,0,0,0,,{prefix}{text_line}")
+                    lines.append(f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Default,,0,0,0,,{{\\c{ass_hex}}}{text_line}")
                 cur = []; cur_len = 0; cur_t0 = None; cur_t1 = None
             for (a, b, w) in toks:
                 wlen = len(w)
@@ -2598,7 +2780,7 @@ def generate_ass_seq_wordtimed(diarization_results, output_ass_path, id_colors_m
                 b = st + (i + 1) * step if i < len(parts) - 1 else et
                 if b <= a:
                     continue
-                lines.append(f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Default,,0,0,0,,{prefix}{ln}")
+                lines.append(f"Dialogue: 0,{_ass_time(a)},{_ass_time(b)},Default,,0,0,0,,{{\\c{ass_hex}}}{ln}")
     with open(output_ass_path, 'w', encoding='utf-8') as f:
         f.write("\n".join(header + lines))
 
@@ -2669,8 +2851,68 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
 
     ID_COLORS = _id_color_map(tracks)
 
+    # Speech bubble helpers (ensure defined in this visualization scope)
+    segs_by_ident = defaultdict(list)
+    if isinstance(diarization_results, list):
+        for seg in diarization_results:
+            ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+            if not (isinstance(ident, str) and ident not in (None, 'None')):
+                continue
+            s = float(seg.get('start', seg.get('start_time', 0.0)))
+            e = float(seg.get('end', seg.get('end_time', s)))
+            if e <= s:
+                continue
+            txt = str(seg.get('text', ''))
+            segs_by_ident[ident].append((s, e, txt))
+        for k in segs_by_ident:
+            segs_by_ident[k].sort(key=lambda x: (x[0], x[1]))
+
+    def _bubble_text_for(ident: str, t_sec: float) -> str:
+        lst = segs_by_ident.get(ident, [])
+        for (s, e, txt) in lst:
+            if s <= t_sec <= e:
+                return txt
+        return ''
+
+    def _wrap_lines(txt: str, max_cn: int = 16, max_lat: int = 24, max_lines: int = 3):
+        wrapped = _wrap_text_for_ass(txt, max_cn, max_lat)
+        lines = [ln for ln in wrapped.split('\\N') if ln.strip()]
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            if lines and not lines[-1].endswith('…'):
+                lines[-1] = lines[-1] + '…'
+        return lines
+
+    def _draw_rounded_rect(img, x, y, w, h, radius, fill_color, border_color, border_th=2, alpha=0.9):
+        x = int(x); y = int(y); w = int(w); h = int(h); radius = int(max(2, radius))
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x+radius, y), (x+w-radius, y+h), fill_color, thickness=-1)
+        cv2.rectangle(overlay, (x, y+radius), (x+w, y+h-radius), fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.circle(overlay, (x+w-radius, y+h-radius), radius, fill_color, thickness=-1)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.rectangle(img, (x+radius, y), (x+w-radius, y+h), border_color, thickness=border_th)
+        cv2.rectangle(img, (x, y+radius), (x+w, y+h-radius), border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+radius, y+h-radius), radius, border_color, thickness=border_th)
+        cv2.circle(img, (x+w-radius, y+h-radius), radius, border_color, thickness=border_th)
+
+    def _draw_tail(img, base_x, base_y, to_left: bool, fill_color, border_color, tail_len=14, tail_half=8, alpha=0.9, border_th=2):
+        base_x = int(base_x); base_y = int(base_y)
+        if to_left:
+            pts = np.array([[base_x, base_y], [base_x+tail_len, base_y-tail_half], [base_x+tail_len, base_y+tail_half]], dtype=np.int32)
+        else:
+            pts = np.array([[base_x, base_y], [base_x-tail_len, base_y-tail_half], [base_x-tail_len, base_y+tail_half]], dtype=np.int32)
+        overlay = img.copy()
+        cv2.fillPoly(overlay, [pts], fill_color)
+        cv2.addWeighted(overlay, alpha, img, 1-alpha, 0, dst=img)
+        cv2.polylines(img, [pts], isClosed=True, color=border_color, thickness=border_th)
+
     # Build global identity thumbnails: one per Person_* for the whole video (no duplicates)
-    tile_w = max(1, min(160, fw // 8))
+    tile_w = max(1, min(100, fw // 12))
     tile_h = tile_w
     margin = 6
     label_height = 28
@@ -2739,7 +2981,15 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
         cap2.release()
         return thumbs
 
-    ID_THUMBS = _build_identity_thumbs(args.videoFilePath, tracks, scores)
+    # Restrict to identities that have spoken anywhere in the video
+    spoken_identities = set()
+    for seg in (diarization_results or []):
+        ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+        if isinstance(ident, str) and ident not in (None, 'None'):
+            spoken_identities.add(ident)
+    # Build thumbnails only for spoken identities
+    ID_THUMBS_ALL = _build_identity_thumbs(args.videoFilePath, tracks, scores)
+    ID_THUMBS = {k: v for k, v in ID_THUMBS_ALL.items() if k in spoken_identities}
 
     cap = cv2.VideoCapture(args.videoFilePath)
     if not cap.isOpened():
@@ -2749,8 +2999,12 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
         ret, image = cap.read()
         if not ret:
             break
+        t_sec = float(fidx) / float(args.videoFps)
         for face in faces_by_frame.get(fidx, []):
             ident = face['identity']
+            # Only visualize faces for identities that have spoken
+            if isinstance(ident, str) and ident not in spoken_identities:
+                continue
             color = ID_COLORS.get(ident, (200, 200, 200))
             bbox_x = int(face['x'] - face['s'])
             bbox_y = int(face['y'] - face['s'])
@@ -2760,11 +3014,7 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
                           (bbox_x, bbox_y),
                           (int(face['x'] + face['s']), int(face['y'] + face['s'])),
                           color, 5)
-            if isinstance(ident, str) and ident != 'None':
-                label = ident + (" (speaking)" if face['score'] > 0 else "")
-                cv2.putText(image, label,
-                            (bbox_x, max(0, bbox_y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                            color, 3)
+            # Speech bubble disabled (rolled back by request)
         # Bottom-left Global Identity Memory (unique per Person_*)
         if ID_THUMBS:
             id_list = sorted(ID_THUMBS.keys())
@@ -2776,7 +3026,7 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
             y0 = max(0, fh - block_h - 10)
             x0 = 10
             cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
-            cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+            cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
             start_y = y0 + label_height
             for idx_m, ident in enumerate(id_list):
                 r = idx_m // cols
@@ -2789,7 +3039,9 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
                 h_t, w_t = thumb.shape[:2]
                 if ty + h_t <= fh and tx + w_t <= fw:
                     image[ty:ty+h_t, tx:tx+w_t] = thumb
-                    cv2.rectangle(image, (tx, ty), (tx + w_t, ty + h_t), (120, 120, 120), 1)
+                    # Use identity color for tile border
+                    color = ID_COLORS.get(ident, (120,120,120))
+                    cv2.rectangle(image, (tx, ty), (tx + w_t, ty + h_t), color, 2)
 
         vOut.write(image)
         fidx += 1
