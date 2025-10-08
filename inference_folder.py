@@ -59,6 +59,13 @@ parser.add_argument('--cropWorkers',          type=int,   default=8,    help='Pa
 parser.add_argument('--sceneWorkers',         type=int,   default=6,    help='Parallel workers for in-memory ASD by scene')
 parser.add_argument('--sceneMinSec',         type=float, default=1.0,  help='Minimum scene length in seconds (detector min_scene_len)')
 
+# Panel rendering (Skia) options
+parser.add_argument('--renderPanel',         action='store_true', default=True, help='Render a Skia side panel with identity chat-like messages (default on)')
+parser.add_argument('--panelWidthRatio',     type=float, default=0.28, help='Right panel width ratio relative to video width (0.2–0.4 recommended)')
+parser.add_argument('--panelMaxItems',       type=int,   default=6,    help='Max messages to show in panel')
+parser.add_argument('--panelTheme',          type=str,   default='glass', choices=['glass','dark'], help='Panel theme style')
+parser.add_argument('--panelCompose',        type=str,   default='raw', choices=['subtitles','raw'], help='Compose panel onto which base: subtitles or raw video')
+
 args, unknown  = parser.parse_known_args()
 
 if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
@@ -1365,32 +1372,7 @@ def visualization(tracks, scores, args):
                 label = ident + (" (speaking)" if face['score'] > 0 else "")
                 cv2.putText(image, label, (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 3)
 
-        # Bottom-left Memory Bank overlay (tracking-based faces)
-        mem_entries = mem_rois_by_frame.get(fidx, [])
-        if mem_entries:
-            max_cols = max(1, min(6, len(mem_entries)))
-            rows = 1 if len(mem_entries) <= max_cols else 2
-            cols = max_cols if rows == 1 else int(math.ceil(len(mem_entries) / 2.0))
-            limit = rows * cols
-            block_w = cols * tile_w + (cols - 1) * margin
-            block_h = rows * tile_h + (rows - 1) * margin + label_height
-            y0 = max(0, fh - block_h - 10)
-            x0 = 10
-            cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
-            cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-            start_y = y0 + label_height
-            for idx_m, (gf, mx, my, ms) in enumerate(mem_entries[:limit]):
-                r = idx_m // cols
-                c = idx_m % cols
-                ty = start_y + r * (tile_h + margin)
-                tx = x0 + c * (tile_w + margin)
-                thumb = get_face_thumb_from_flist(int(gf), mx, my, ms)
-                if thumb is None:
-                    continue
-                h_t, w_t = thumb.shape[:2]
-                if ty + h_t <= fh and tx + w_t <= fw:
-                    image[ty:ty+h_t, tx:tx+w_t] = thumb
-                    cv2.rectangle(image, (tx, ty), (tx + w_t, ty + h_t), (120, 120, 120), 1)
+        # Memory bank overlay removed: now shown in side panel
         vOut.write(image)
     vOut.release()
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
@@ -1518,6 +1500,11 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
     hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
     if not hf_token:
         raise RuntimeError("Missing HuggingFace token: set HF_TOKEN or HUGGINGFACE_TOKEN in environment.")
+    # Ensure huggingface_hub & pyannote kw compatibility (token vs use_auth_token)
+    _patch_hf_hub_token_kw()
+    _patch_pyannote_hf_token_kw()
+    # Also expose token to HF via standard env so downstream libs can pick it up
+    os.environ.setdefault('HUGGINGFACE_HUB_TOKEN', hf_token)
 
     try:
         diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
@@ -2022,7 +2009,9 @@ def split_segments_by_positive_fill(annotated_tracks, scores, raw_segments, fps:
             if c > 0:
                 pos_counts[ident] += c
         if not pos_counts:
-            raise RuntimeError("No identity with positive ASD within diarization segment; cannot assign labels.")
+            # No positive ASD evidence in this diarization window: emit the segment as unassigned.
+            out.append({'start': s, 'end': e, 'identity': 'None', 'text': seg.get('text', '')})
+            continue
         sent_top = max(pos_counts.items(), key=lambda x: x[1])[0]
 
         # framewise assignment with fill
@@ -2568,6 +2557,538 @@ def _collapse_to_single_line(segments):
     out2 = [s for s in out if (s['end'] - s['start']) > 1e-3]
     return out2
 
+# Compatibility shim: huggingface_hub >= 0.20 removed 'use_auth_token' kw in favor of 'token'.
+# Some dependencies (pyannote.audio, whisperx) still pass 'use_auth_token'.
+def _patch_hf_hub_token_kw():
+    try:
+        import huggingface_hub as _h
+    except Exception:
+        return
+    # Patch hf_hub_download
+    try:
+        _orig = _h.hf_hub_download
+        def _wrap_hf_hub_download(*args, **kwargs):
+            if 'use_auth_token' in kwargs and 'token' not in kwargs:
+                tok = kwargs.pop('use_auth_token')
+                if isinstance(tok, (str, bytes)):
+                    kwargs['token'] = tok
+                else:
+                    # Ignore boolean/None legacy; rely on env/cached token
+                    pass
+            return _orig(*args, **kwargs)
+        _h.hf_hub_download = _wrap_hf_hub_download  # type: ignore
+    except Exception:
+        pass
+    # Patch snapshot_download as well
+    try:
+        _orig_s = _h.snapshot_download
+        def _wrap_snapshot_download(*args, **kwargs):
+            if 'use_auth_token' in kwargs and 'token' not in kwargs:
+                tok = kwargs.pop('use_auth_token')
+                if isinstance(tok, (str, bytes)):
+                    kwargs['token'] = tok
+            return _orig_s(*args, **kwargs)
+        _h.snapshot_download = _wrap_snapshot_download  # type: ignore
+    except Exception:
+        pass
+
+def _patch_pyannote_hf_token_kw():
+    """Patch pyannote modules that captured hf_hub_download/snapshot_download
+    to translate 'use_auth_token' -> 'token'.
+    """
+    try:
+        import importlib
+        import huggingface_hub as _h
+    except Exception:
+        return
+
+    def _compat(func):
+        def _wrap(*args, **kwargs):
+            if 'use_auth_token' in kwargs and 'token' not in kwargs:
+                tok = kwargs.pop('use_auth_token')
+                if isinstance(tok, (str, bytes)):
+                    kwargs['token'] = tok
+            return func(*args, **kwargs)
+        return _wrap
+
+    modules = [
+        'pyannote.audio.core.pipeline',
+        'pyannote.audio.core.model',
+        'pyannote.audio.core.inference',
+        'pyannote.audio.pipelines.utils.getter',
+        'pyannote.audio.pipelines.speaker_diarization',
+    ]
+    for name in modules:
+        try:
+            m = importlib.import_module(name)
+        except Exception:
+            continue
+        try:
+            if hasattr(m, 'hf_hub_download'):
+                setattr(m, 'hf_hub_download', _compat(_h.hf_hub_download))
+        except Exception:
+            pass
+        try:
+            if hasattr(m, 'snapshot_download'):
+                setattr(m, 'snapshot_download', _compat(_h.snapshot_download))
+        except Exception:
+            pass
+
+# ===== Modern Skia Panel Rendering =====
+def _id_color_map_global(tracks_list):
+    ids = []
+    for tr in tracks_list:
+        ident = tr.get('identity', None)
+        if isinstance(ident, str) and ident not in (None, 'None'):
+            ids.append(_normalize_identity_prefix(ident))
+    uniq = sorted(set(ids))
+    colors = {}
+    import colorsys, hashlib
+    for ident in uniq:
+        hval = int(hashlib.md5(ident.encode('utf-8')).hexdigest()[:8], 16)
+        h = (hval % 360) / 360.0
+        s = 0.65
+        v = 0.95
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        colors[ident] = (int(r * 255), int(g * 255), int(b * 255))  # RGB tuple for Skia
+    return colors
+
+def _ffprobe_video_props(path):
+    import json, subprocess
+    cmd = [
+        'ffprobe','-v','error','-select_streams','v:0',
+        '-show_entries','stream=width,height,avg_frame_rate,duration',
+        '-of','json', path
+    ]
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode('utf-8')
+    js = json.loads(out)
+    st = (js.get('streams') or [{}])[0]
+    w = int(st.get('width', 0))
+    h = int(st.get('height', 0))
+    fr = st.get('avg_frame_rate', '0/1')
+    try:
+        if '/' in fr:
+            a,b = fr.split('/')
+            fps = float(a)/float(b) if float(b) != 0 else 0.0
+        else:
+            fps = float(fr)
+    except Exception:
+        fps = 0.0
+    try:
+        dur = float(st.get('duration', 0.0))
+    except Exception:
+        # duration can be at format level; fallback probe
+        out2 = subprocess.check_output([
+            'ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1', path
+        ], stderr=subprocess.STDOUT).decode('utf-8').strip()
+        try:
+            dur = float(out2)
+        except Exception:
+            dur = 0.0
+    if w <= 0 or h <= 0 or fps <= 0:
+        raise RuntimeError(f"Invalid video props for {path}: {w}x{h} @ {fps}")
+    return w, h, fps, max(0.0, dur)
+
+def _collect_identity_avatar_targets(tracks_list):
+    """Pick one representative (frame, x, y, s) per identity from tracks.
+    Returns dict ident -> (frame_index, x, y, s).
+    """
+    targets = {}
+    for tr in tracks_list:
+        ident = _normalize_identity_prefix(tr.get('identity'))
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        if ident in targets:
+            continue
+        frames_arr = tr.get('track', {}).get('frame')
+        proc = tr.get('proc_track', {})
+        if frames_arr is None or not isinstance(proc, dict):
+            continue
+        frames = frames_arr.tolist() if hasattr(frames_arr, 'tolist') else list(frames_arr)
+        xs = proc.get('x', []); ys = proc.get('y', []); ss = proc.get('s', [])
+        if not frames or not xs or not ys or not ss:
+            continue
+        mid = len(frames)//2
+        try:
+            targets[ident] = (int(frames[mid]), float(xs[mid]), float(ys[mid]), float(ss[mid]))
+        except Exception:
+            continue
+    return targets
+
+def _build_identity_avatars_pyav(video_path, tracks_list, max_edge=96):
+    """Decode required frames via PyAV and crop avatar ROIs as numpy RGB arrays.
+    Returns dict ident -> np.ndarray(H,W,3) RGB.
+    """
+    try:
+        import av  # PyAV
+    except Exception as e:
+        raise RuntimeError('PyAV is required to decode frames for panel avatars') from e
+
+    targets = _collect_identity_avatar_targets(tracks_list)
+    if not targets:
+        return {}
+    # Build reverse map: frame_index -> list[(ident, x,y,s)]
+    by_frame = {}
+    for ident, (fi, x, y, s) in targets.items():
+        by_frame.setdefault(int(fi), []).append((ident, float(x), float(y), float(s)))
+    needed = set(by_frame.keys())
+
+    try:
+        container = av.open(video_path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to open video for avatars: {video_path}") from e
+
+    thumbs = {}
+    fidx = -1
+    try:
+        for frame in container.decode(video=0):
+            fidx += 1
+            if fidx not in needed:
+                continue
+            img = frame.to_ndarray(format='rgb24')  # H,W,3 RGB
+            H, W = img.shape[:2]
+            for (ident, x, y, s) in by_frame[fidx]:
+                x1 = max(0, int(x - s)); y1 = max(0, int(y - s))
+                x2 = min(W, int(x + s)); y2 = min(H, int(y + s))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                roi = img[y1:y2, x1:x2].copy()
+                # Optional: downscale if very large to save memory; final scale at draw time
+                mh, mw = roi.shape[:2]
+                if max(mh, mw) > 512:
+                    # simple stride-based reduce to avoid heavy deps
+                    step = int(max(2, round(max(mh, mw)/256)))
+                    roi = roi[::step, ::step]
+                thumbs[ident] = roi
+            if len(thumbs) == len(targets):
+                break
+    finally:
+        container.close()
+    return thumbs
+
+def _wrap_for_panel(text: str, text_w_px: int, font_size_px: float, max_lines: int = 4) -> list:
+    # Estimate per-char width; CJK ~ 1.0*font_size, Latin ~0.58*font_size
+    t = (text or '').strip()
+    if not t:
+        return []
+    has_cjk = any('\u4e00' <= ch <= '\u9fff' for ch in t)
+    if has_cjk:
+        max_chars = max(1, int(text_w_px / max(1.0, font_size_px * 1.02)))
+    else:
+        max_chars = max(1, int(text_w_px / max(1.0, font_size_px * 0.58)))
+    wrapped = _wrap_text_for_ass(t, max_chars_cn=max_chars, max_chars_lat=max_chars)
+    lines = [ln for ln in wrapped.split('\\N') if ln.strip()]
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        if not lines[-1].endswith('…'):
+            lines[-1] += '…'
+    return lines
+
+def render_side_panel_skia(base_video_path: str,
+                           diarization_results: list,
+                           tracks: list,
+                           output_panel_path: str,
+                           width_ratio: float = 0.28,
+                           theme: str = 'glass',
+                           max_items: int = 6):
+    """Render a right-side animated chat-like panel using Skia and compose with ffmpeg.
+    Produces a standalone panel video at output_panel_path (no audio).
+    """
+    import os, subprocess, math
+    import numpy as _np
+    try:
+        import skia  # type: ignore
+    except Exception as e:
+        raise RuntimeError('skia-python is required for panel rendering') from e
+
+    # Probe base video
+    W, H, fps_eff, dur = _ffprobe_video_props(base_video_path)
+    panel_w = max(64, int(round(float(W) * float(width_ratio))))
+    panel_h = H
+    total_frames = int(math.floor(dur * fps_eff)) if dur > 0 else None
+
+    # Fonts
+    fonts_dir_abs, font_name = _ensure_chinese_font()
+    # Try to load bundled Noto font file
+    font_path = os.path.join(fonts_dir_abs, 'NotoSansCJKsc-Regular.otf')
+    if not os.path.isfile(font_path):
+        # Fallback to any OTF in fonts_dir_abs
+        cands = [f for f in os.listdir(fonts_dir_abs) if f.lower().endswith(('.otf', '.ttf'))]
+        if not cands:
+            raise RuntimeError('No suitable font file found for Skia panel')
+        font_path = os.path.join(fonts_dir_abs, cands[0])
+    typeface = skia.Typeface.MakeFromFile(font_path)
+    if typeface is None:
+        raise RuntimeError(f'Failed to load typeface from {font_path}')
+    font_title = skia.Font(typeface, 20)
+    font_text = skia.Font(typeface, 18)
+
+    # Identity colors and avatars
+    id_colors = _id_color_map_global(tracks)
+    avatars = _build_identity_avatars_pyav(args.videoFilePath, tracks, max_edge=120)
+    # Memory identities: all unique non-None identities present in tracks
+    mem_idents = []
+    seen = set()
+    for tr in tracks:
+        ident = _normalize_identity_prefix(tr.get('identity'))
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        if ident in seen:
+            continue
+        seen.add(ident)
+        mem_idents.append(ident)
+    mem_idents.sort()
+
+    # Build messages timeline
+    msgs = []
+    for seg in (diarization_results or []):
+        ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        s = float(seg.get('start', seg.get('start_time', 0.0)))
+        e = float(seg.get('end', seg.get('end_time', s)))
+        if e <= s:
+            continue
+        txt = str(seg.get('text', '')).strip()
+        msgs.append({'identity': ident, 'start': s, 'end': e, 'text': txt})
+    msgs.sort(key=lambda m: (m['start'], m['end']))
+
+    # ffmpeg pipe for panel encoding
+    cmd = [
+        'ffmpeg','-y','-f','rawvideo','-pix_fmt','rgb24',
+        '-s', f'{panel_w}x{panel_h}','-r', f'{fps_eff}',
+        '-i','-','-an','-c:v','libx264','-pix_fmt','yuv420p',
+        '-preset','veryfast','-crf','20', output_panel_path,
+        '-loglevel','error'
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    # Drawing helpers
+    def ease_out_cubic(x: float) -> float:
+        x = max(0.0, min(1.0, x))
+        return 1.0 - (1.0 - x) ** 3
+
+    # Layout constants
+    pad = 16
+    card_gap = 10
+    avatar_r = 26
+    avatar_d = avatar_r * 2
+    ring_th = 3
+    text_gap = 10
+    title_color = skia.ColorSetARGB(255, 230, 230, 235)
+    text_color = skia.ColorSetARGB(255, 220, 220, 220)
+    time_color = skia.ColorSetARGB(255, 170, 170, 180)
+    card_bg = skia.ColorSetARGB(180, 28, 28, 32)
+    card_active = skia.ColorSetARGB(210, 40, 40, 50)
+    border_color = skia.ColorSetARGB(200, 70, 70, 80)
+    glow_color = skia.ColorSetARGB(160, 50, 120, 255)
+    # Background
+    bg_grad_c1 = skia.ColorSetARGB(255, 16, 16, 20)
+    bg_grad_c2 = skia.ColorSetARGB(255, 6, 6, 8)
+
+    # Precompute text area width for wrapping
+    text_w = panel_w - pad*2 - avatar_d - text_gap
+
+    # Pre-wrap message text to lines according to panel width
+    for m in msgs:
+        m['lines'] = _wrap_for_panel(m['text'], text_w, font_text.getSize(), max_lines=4)
+        # Precompute title (identity + timestamp placeholder computed per-frame)
+
+    # Frame loop
+    info = skia.ImageInfo.Make(panel_w, panel_h, skia.ColorType.kRGBA_8888_ColorType, skia.AlphaType.kUnpremul_AlphaType)
+    buf = _np.empty((panel_h, panel_w, 4), dtype=_np.uint8)
+
+    # Pre-allocate paints
+    p_fill = skia.Paint(AntiAlias=True)
+    p_stroke = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style)
+    p_text = skia.Paint(AntiAlias=True, Color=text_color)
+    p_title = skia.Paint(AntiAlias=True, Color=title_color)
+    p_time = skia.Paint(AntiAlias=True, Color=time_color)
+
+    def draw_frame(canvas: 'skia.Canvas', t: float):
+        # Background gradient
+        shader = skia.GradientShader.MakeLinear(
+            [skia.Point(0, 0), skia.Point(0, panel_h)],
+            [bg_grad_c1, bg_grad_c2],
+            [0.0, 1.0],
+            skia.TileMode.kClamp
+        )
+        p_bg = skia.Paint(AntiAlias=True)
+        p_bg.setShader(shader)
+        canvas.drawRect(skia.Rect.MakeWH(panel_w, panel_h), p_bg)
+        # Memory bank (top area)
+        mem_pad = 12
+        avatar_sz = 42
+        cols = max(1, min(6, panel_w // (avatar_sz + mem_pad)))
+        rows = (len(mem_idents) + cols - 1) // cols if mem_idents else 0
+        mem_h = 0
+        if rows > 0:
+            title_h = int(font_title.getSize() * 1.2)
+            grid_h = rows * avatar_sz + (rows - 1) * mem_pad
+            mem_h = mem_pad + title_h + 6 + grid_h + mem_pad
+            # Title
+            canvas.drawString('Memory', mem_pad, mem_pad + font_title.getSize(), font_title, p_title)
+            # Grid
+            start_y = mem_pad + title_h + 6
+            for idx, ident in enumerate(mem_idents):
+                r = idx // cols
+                c = idx % cols
+                cx = int(mem_pad + c * (avatar_sz + mem_pad) + avatar_sz / 2)
+                cy = int(start_y + r * (avatar_sz + mem_pad) + avatar_sz / 2)
+                # ring
+                rgb = id_colors.get(ident, (200, 200, 200))
+                ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style)
+                ring.setColor(skia.ColorSetRGB(*rgb))
+                ring.setStrokeWidth(3)
+                canvas.drawCircle(cx, cy, avatar_sz / 2 + 2, ring)
+                # avatar
+                ava = avatars.get(ident)
+                if isinstance(ava, _np.ndarray) and ava.size > 0:
+                    h0, w0 = ava.shape[:2]
+                    arr_rgba = _np.concatenate([ava, _np.full((h0, w0, 1), 255, dtype=_np.uint8)], axis=-1)
+                    sk_img = skia.Image.fromarray(arr_rgba)
+                    if sk_img is not None:
+                        canvas.save()
+                        path = skia.Path(); path.addCircle(cx, cy, avatar_sz/2)
+                        canvas.clipPath(path, doAntiAlias=True)
+                        dst = skia.Rect.MakeXYWH(cx - avatar_sz/2, cy - avatar_sz/2, avatar_sz, avatar_sz)
+                        canvas.drawImageRect(sk_img, dst, skia.SamplingOptions(skia.FilterMode.kLinear))
+                        canvas.restore()
+
+        # Select visible messages up to time t (keep last max_items)
+        vis = [m for m in msgs if m['start'] <= t]
+        if not vis:
+            return
+        vis = vis[-max_items:]
+
+        # Compute total height to bottom-stack cards
+        # Each card height: max(avatar_d, title+lines*line_h) + padding*2
+        line_h = int(font_text.getSize() * 1.3)
+        title_h = int(font_title.getSize() * 1.2)
+        card_pad_v = 10
+        card_pad_h = 12
+        card_rects = []
+        heights = []
+        for m in vis:
+            text_h = title_h + (len(m['lines']) * line_h)
+            h = max(avatar_d, text_h) + card_pad_v*2
+            heights.append(h)
+        total_h = sum(heights) + card_gap * (len(heights) - 1)
+        # Ensure chat area starts after memory block
+        y_top = mem_h + pad
+        y = max(y_top, panel_h - pad - total_h)
+        # Draw each card
+        for i, m in enumerate(vis):
+            h = heights[i]
+            # Appear animation
+            appear = ease_out_cubic((t - m['start']) / 0.18)
+            x_offset = int((1.0 - appear) * 30)
+            alpha_scale = appear
+            # Active highlight
+            active = (m['start'] <= t <= m['end'])
+            bg_col = card_active if active else card_bg
+            # Card bg with rounded rect
+            rect = skia.Rect.MakeXYWH(pad + x_offset, y, panel_w - pad*2, h)
+            rrect = skia.RRect.MakeRectXY(rect, 14, 14)
+            # Shadow (use ImageFilters.DropShadow for compatibility)
+            shadow = skia.Paint(AntiAlias=True)
+            shadow.setColor(skia.ColorSetARGB(int(70*alpha_scale), 0, 0, 0))
+            try:
+                drop = skia.ImageFilters.DropShadow(0, 3, 10, 10, skia.ColorSetARGB(int(140*alpha_scale), 0, 0, 0))
+                shadow.setImageFilter(drop)
+            except Exception:
+                # If ImageFilters unavailable, skip filter but keep solid shadow color
+                pass
+            canvas.drawRRect(rrect, shadow)
+            # Fill
+            p_fill.setColor(bg_col)
+            p_fill.setAlphaf(float(alpha_scale))
+            canvas.drawRRect(rrect, p_fill)
+            # Border
+            p_stroke.setColor(border_color)
+            p_stroke.setStrokeWidth(1.5)
+            p_stroke.setAlphaf(0.8 * float(alpha_scale))
+            canvas.drawRRect(rrect, p_stroke)
+            # Active glow accent bar
+            if active:
+                pulse = 0.5 + 0.5 * math.sin((t - m['start']) * 6.28 * 0.8)
+                gpaint = skia.Paint(AntiAlias=True)
+                gpaint.setColor(glow_color)
+                gpaint.setAlphaf(0.25 + 0.35 * pulse)
+                canvas.drawRRect(skia.RRect.MakeRectXY(skia.Rect.MakeXYWH(rect.left(), rect.top(), 6, rect.height()), 3, 3), gpaint)
+
+            # Avatar circle
+            cx = rect.left() + card_pad_h + avatar_r
+            cy = rect.top() + card_pad_v + avatar_r
+            # Accent ring
+            rgb = id_colors.get(m['identity'], (200, 200, 200))
+            ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style)
+            ring.setColor(skia.ColorSetRGB(*rgb))
+            ring.setStrokeWidth(ring_th)
+            ring.setAlphaf(float(alpha_scale))
+            canvas.drawCircle(cx, cy, avatar_r + ring_th*0.5, ring)
+            # Clip circle and draw avatar image
+            ava_img = avatars.get(m['identity'])
+            if isinstance(ava_img, _np.ndarray) and ava_img.size > 0:
+                # Convert numpy RGB to Skia Image
+                h0, w0 = ava_img.shape[:2]
+                # Skia expects RGBA for fromarray; add alpha channel
+                arr_rgba = _np.concatenate([ava_img, _np.full((h0, w0, 1), 255, dtype=_np.uint8)], axis=-1)
+                sk_img = skia.Image.fromarray(arr_rgba)
+                if sk_img is not None:
+                    canvas.save()
+                    path = skia.Path()
+                    path.addCircle(cx, cy, avatar_r)
+                    canvas.clipPath(path, doAntiAlias=True)
+                    dst = skia.Rect.MakeXYWH(cx - avatar_r, cy - avatar_r, avatar_d, avatar_d)
+                    canvas.drawImageRect(sk_img, dst, skia.SamplingOptions(skia.FilterMode.kLinear))
+                    canvas.restore()
+
+            # Title: identity + time
+            ts_min = int(m['start'] // 60)
+            ts_sec = int(m['start'] % 60)
+            title = f"{m['identity']}  {ts_min:02d}:{ts_sec:02d}"
+            tx = rect.left() + card_pad_h + avatar_d + text_gap
+            ty = rect.top() + card_pad_v + font_title.getSize()
+            p_title.setAlphaf(float(alpha_scale))
+            canvas.drawString(title, tx, ty, font_title, p_title)
+
+            # Text lines
+            p_text.setAlphaf(float(alpha_scale))
+            for li, line in enumerate(m['lines']):
+                ly = ty + 6 + (li + 1) * line_h
+                canvas.drawString(line, tx, ly, font_text, p_text)
+
+            # next y
+            y += h + card_gap
+
+    # Render frames
+    try:
+        i = 0
+        while True:
+            if total_frames is not None and i >= total_frames:
+                break
+            t = i / fps_eff
+            surface = skia.Surface(panel_w, panel_h)
+            canvas = surface.getCanvas()
+            draw_frame(canvas, t)
+            # Read pixels to numpy
+            # Read pixels into numpy buffer (use buffer protocol, rowBytes = first stride)
+            row_bytes = int(buf.strides[0])
+            ok = surface.readPixels(info, buf, row_bytes)
+            if not ok:
+                raise RuntimeError('Failed to read Skia surface pixels')
+            frame_rgb = buf[:, :, :3]
+            proc.stdin.write(frame_rgb.tobytes())
+            i += 1
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait()
+
+
 def generate_ass(diarization_results, output_ass_path, id_colors_map, font_name_override=None):
     # Build ASS header + events with inline color for Person_[ID]
     font_name = font_name_override or 'Noto Sans CJK SC'
@@ -3015,62 +3536,19 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
                           (int(face['x'] + face['s']), int(face['y'] + face['s'])),
                           color, 5)
             # Speech bubble disabled (rolled back by request)
-        # Bottom-left Global Identity Memory (unique per Person_*)
-        if ID_THUMBS:
-            id_list = sorted(ID_THUMBS.keys())
-            max_cols = max(1, min(6, len(id_list)))
-            rows = int(math.ceil(len(id_list) / float(max_cols)))
-            cols = max_cols
-            block_w = cols * tile_w + (cols - 1) * margin
-            block_h = rows * tile_h + (rows - 1) * margin + label_height
-            y0 = max(0, fh - block_h - 10)
-            x0 = 10
-            cv2.rectangle(image, (x0 - 6, y0 - 6), (x0 + block_w + 6, y0 + block_h + 6), (0, 0, 0), thickness=-1)
-            cv2.putText(image, 'Memory', (x0, y0 + label_height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
-            start_y = y0 + label_height
-            for idx_m, ident in enumerate(id_list):
-                r = idx_m // cols
-                c = idx_m % cols
-                ty = start_y + r * (tile_h + margin)
-                tx = x0 + c * (tile_w + margin)
-                thumb = ID_THUMBS.get(ident)
-                if thumb is None:
-                    continue
-                h_t, w_t = thumb.shape[:2]
-                if ty + h_t <= fh and tx + w_t <= fw:
-                    image[ty:ty+h_t, tx:tx+w_t] = thumb
-                    # Use identity color for tile border
-                    color = ID_COLORS.get(ident, (120,120,120))
-                    cv2.rectangle(image, (tx, ty), (tx + w_t, ty + h_t), color, 2)
+        # Memory tiles removed from main video; now shown in side panel
 
         vOut.write(image)
         fidx += 1
     cap.release()
     vOut.release()
 
-    # Generate ASS subtitles and merge variants
-    output_ass_path = os.path.join(args.pyaviPath, 'subtitles.ass')
-    fonts_dir_abs, font_name = _ensure_chinese_font()
-    generate_ass_seq_wordtimed(diarization_results, output_ass_path, ID_COLORS, font_name_override=font_name or 'Noto Sans CJK SC', words_list=words_list)
-
+    # Merge audio without generating subtitles (panel will carry text)
     video_with_audio_path = os.path.join(args.pyaviPath, 'video_out_with_audio.avi')
     command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" %
               (os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'),
                 args.nDataLoaderThread, video_with_audio_path))
     subprocess.call(command, shell=True)
-
-    video_with_subtitles_path = os.path.join(args.pyaviPath, 'video_out_with_subtitles.avi')
-    vf = f"subtitles={output_ass_path}:fontsdir={fonts_dir_abs}"
-    command_with_subtitles = (
-        "ffmpeg -y -i %s -vf \"%s\" -c:v libx264 -preset ultrafast -crf 23 %s -loglevel panic" %
-        (video_with_audio_path, vf, video_with_subtitles_path)
-    )
-    subprocess.call(command_with_subtitles, shell=True)
-
-    video_without_subtitles_path = os.path.join(args.pyaviPath, 'video_out_without_subtitles.avi')
-    command_without_subtitles = ("ffmpeg -y -i %s -c copy %s -loglevel panic" %
-                                (video_with_audio_path, video_without_subtitles_path))
-    subprocess.call(command_without_subtitles, shell=True)
 
 def process_folder():
     videoNames = [os.path.splitext(os.path.basename(v))[0] for v in glob.glob(os.path.join(args.videoFolder, '*.*'))]
@@ -3454,7 +3932,35 @@ def process_video():
     # Visualization, save the result as the new video    
     # Build word list for word-timed subtitles
     flat_words = _flatten_aligned_words(raw_results["segments"]) if isinstance(raw_results, dict) and 'segments' in raw_results else _flatten_aligned_words(raw_results)
-    visualization(annotated_tracks, scores, diar_for_subs, args, words_list=flat_words)    
+    visualization(annotated_tracks, scores, diar_for_subs, args, words_list=flat_words)
+
+    # Optional: Skia side panel with chat-like messages (compose onto subtitles video)
+    if bool(getattr(args, 'renderPanel', False)):
+        # Compose panel onto raw (with audio) video by default
+        base_in = os.path.join(args.pyaviPath, 'video_out_with_audio.avi') if args.panelCompose == 'raw' else os.path.join(args.pyaviPath, 'video_out_with_audio.avi')
+        if not os.path.isfile(base_in):
+            raise RuntimeError(f"Base video for panel composition not found: {base_in}")
+        panel_out = os.path.join(args.pyaviPath, 'video_panel.mp4')
+        sys.stderr.write(f"Rendering Skia side panel to {panel_out}...\n")
+        render_side_panel_skia(
+            base_in,
+            diar_for_subs,
+            annotated_tracks,
+            panel_out,
+            width_ratio=float(getattr(args, 'panelWidthRatio', 0.28)),
+            theme=str(getattr(args, 'panelTheme', 'glass')).lower(),
+            max_items=int(getattr(args, 'panelMaxItems', 6)),
+        )
+        # Compose side-by-side (hstack), keep audio from base
+        combined = os.path.join(args.pyaviPath, 'video_with_panel.mp4')
+        cmd_combine = (
+            f"ffmpeg -y -i {base_in} -i {panel_out} -filter_complex \"[0:v][1:v]hstack=inputs=2[v]\" "
+            f"-map \"[v]\" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -c:a aac -b:a 192k -ar 16000 {combined} -loglevel error"
+        )
+        rc = subprocess.call(cmd_combine, shell=True)
+        if rc != 0:
+            raise RuntimeError("Failed to compose base video with side panel via ffmpeg hstack")
+        sys.stderr.write(f"Composed video saved: {combined}\n")
 
 if __name__ == '__main__':
     process_folder()
