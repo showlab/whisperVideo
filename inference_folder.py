@@ -2965,7 +2965,7 @@ def render_side_panel_skia(base_video_path: str,
         # Each card height: max(avatar_d, title+lines*line_h) + padding*2
         line_h = int(font_text.getSize() * 1.3)
         title_h = int(font_title.getSize() * 1.2)
-        card_pad_v = 10
+        card_pad_v = 12
         card_pad_h = 12
         card_rects = []
         heights = []
@@ -2974,14 +2974,25 @@ def render_side_panel_skia(base_video_path: str,
             h = max(avatar_d, text_h) + card_pad_v*2
             heights.append(h)
         total_h = sum(heights) + card_gap * (len(heights) - 1)
-        # Ensure chat area starts after memory block
+        # Ensure chat area starts after memory block and ends above bottom padding
         y_top = mem_h + pad
-        y = max(y_top, panel_h - pad - total_h)
+        y_post = max(y_top, panel_h - pad - total_h)
+        # Slide-up animation when a new message arrives: smoothly shift stack upward
+        slide_dur = 0.25
+        y = y_post
+        if len(vis) >= 1:
+            newest = vis[-1]
+            # Height of newest card
+            h_new = heights[-1]
+            # Progress from 0..1 since newest.start
+            p = ease_out_cubic((t - float(newest['start'])) / slide_dur) if t >= float(newest['start']) else 0.0
+            # Before the newest settles, the whole stack is offset downward by (1-p)*(h_new+gap)
+            y += (1.0 - p) * (h_new + (card_gap if len(vis) > 1 else 0))
         # Draw each card
         for i, m in enumerate(vis):
             h = heights[i]
-            # Appear animation
-            appear = ease_out_cubic((t - m['start']) / 0.18)
+            # Appear animation (x-slide + fade)
+            appear = ease_out_cubic((t - float(m['start'])) / 0.18)
             x_offset = int((1.0 - appear) * 30)
             alpha_scale = appear
             # Active highlight
