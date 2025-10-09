@@ -99,4 +99,21 @@ class talkNet(nn.Module):
             if selfState[name].size() != loadedState[origName].size():
                 sys.stderr.write("Wrong parameter length: %s, model: %s, loaded: %s"%(origName, selfState[name].size(), loadedState[origName].size()))
                 continue
-            selfState[name].copy_(param)
+        selfState[name].copy_(param)
+
+    def forward(self, inputA: torch.Tensor, inputV: torch.Tensor):
+        """End-to-end forward used for multi-GPU inference (DataParallel/DDP).
+
+        This preserves the exact evaluation path used elsewhere:
+          audio -> audio_frontend ->
+          visual -> visual_frontend ->
+          cross attention -> audio_visual backend -> out (B*T, 256)
+
+        The caller is responsible for computing scores via self.lossAV.forward(out, labels=None).
+        """
+        # Expect inputA: (B, T_a, 13), inputV: (B, T_v, 112, 112) on the correct device
+        audioEmbed = self.model.forward_audio_frontend(inputA)
+        visualEmbed = self.model.forward_visual_frontend(inputV)
+        audioEmbed, visualEmbed = self.model.forward_cross_attention(audioEmbed, visualEmbed)
+        out = self.model.forward_audio_visual_backend(audioEmbed, visualEmbed)
+        return out

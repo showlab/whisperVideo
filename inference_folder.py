@@ -554,6 +554,9 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
 
     # 3) TalkNet ASD with cross-track batching per duration
     s = talkNet(); s.loadParameters(args.pretrainModel); s.eval()
+    # Enable multi-GPU inference via DataParallel when multiple GPUs are available.
+    use_dp = (torch.cuda.device_count() > 1)
+    dp_model = torch.nn.DataParallel(s) if use_dp else None
     durationU = [1,2,3,4,5,6]
     # load full audio once
     _, full_audio = wavfile.read(os.path.join(args.pyaviPath, 'audio.wav'))
@@ -619,12 +622,17 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
                         break
             # forward if batch non-empty
             if batchA:
-                inputA = torch.FloatTensor(np.stack(batchA,axis=0)).cuda()
-                inputV = torch.FloatTensor(np.stack(batchV,axis=0)).cuda()
-                embedA = s.model.forward_audio_frontend(inputA)
-                embedV = s.model.forward_visual_frontend(inputV)
-                embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
-                out = s.model.forward_audio_visual_backend(embedA, embedV)
+                if use_dp:
+                    inputA = torch.from_numpy(np.stack(batchA, axis=0).astype(np.float32))
+                    inputV = torch.from_numpy(np.stack(batchV, axis=0).astype(np.float32))
+                    out = dp_model(inputA, inputV)
+                else:
+                    inputA = torch.FloatTensor(np.stack(batchA,axis=0)).cuda()
+                    inputV = torch.FloatTensor(np.stack(batchV,axis=0)).cuda()
+                    embedA = s.model.forward_audio_frontend(inputA)
+                    embedV = s.model.forward_visual_frontend(inputV)
+                    embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
+                    out = s.model.forward_audio_visual_backend(embedA, embedV)
                 scoreBatch = s.lossAV.forward(out, labels=None)
                 scoreBatch = np.asarray(scoreBatch)
                 # Split back per-window using uniform per-window length, then dispatch to owners
@@ -656,12 +664,17 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
             a_tail = a_feat[usedA: usedA + winA, :]
             v_tail = v_arr[usedV: usedV + winV, :, :]
             if a_tail.shape[0] > 0 and v_tail.shape[0] > 0:
-                inputA = torch.FloatTensor(a_tail).unsqueeze(0).cuda()
-                inputV = torch.FloatTensor(v_tail).unsqueeze(0).cuda()
-                embedA = s.model.forward_audio_frontend(inputA)
-                embedV = s.model.forward_visual_frontend(inputV)
-                embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
-                out = s.model.forward_audio_visual_backend(embedA, embedV)
+                if use_dp:
+                    inputA = torch.from_numpy(a_tail.astype(np.float32)).unsqueeze(0)
+                    inputV = torch.from_numpy(v_tail.astype(np.float32)).unsqueeze(0)
+                    out = dp_model(inputA, inputV)
+                else:
+                    inputA = torch.FloatTensor(a_tail).unsqueeze(0).cuda()
+                    inputV = torch.FloatTensor(v_tail).unsqueeze(0).cuda()
+                    embedA = s.model.forward_audio_frontend(inputA)
+                    embedV = s.model.forward_visual_frontend(inputV)
+                    embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
+                    out = s.model.forward_audio_visual_backend(embedA, embedV)
                 score_tail = s.lossAV.forward(out, labels=None)
                 try:
                     vals = np.asarray(score_tail).tolist()
@@ -2823,9 +2836,113 @@ def render_side_panel_skia(base_video_path: str,
     font_title = skia.Font(typeface, 20)
     font_text = skia.Font(typeface, 18)
 
-    # Identity colors and avatars
+    # Identity colors and avatars (quality-aware via MagFace)
     id_colors = _id_color_map_global(tracks)
-    avatars = _build_identity_avatars_pyav(args.videoFilePath, tracks, max_edge=120)
+    def _build_identity_avatars_magface(video_path: str, tracks_list: list, max_per_ident: int = 16):
+        try:
+            # Deferred import to avoid heavy init when not needed
+            from .embedders.magface_embedder import MagFaceEmbedder
+        except Exception:
+            from embedders.magface_embedder import MagFaceEmbedder
+        import av
+        import numpy as _np
+        import cv2 as _cv
+
+        # Build candidates: ident -> list[(frame_idx, x, y, s)] sampled across its tracks
+        cand = {}
+        for tr in tracks_list:
+            ident = _normalize_identity_prefix(tr.get('identity'))
+            if not (isinstance(ident, str) and ident not in (None, 'None')):
+                continue
+            proc = tr.get('proc_track', {})
+            frames = tr.get('track', {}).get('frame')
+            if frames is None or not isinstance(proc, dict):
+                continue
+            xs = proc.get('x', []); ys = proc.get('y', []); ss = proc.get('s', [])
+            fl = frames.tolist() if hasattr(frames, 'tolist') else list(frames)
+            if not fl or not xs or not ys or not ss:
+                continue
+            n = len(fl)
+            step = max(1, n // max_per_ident)
+            for k in range(0, n, step):
+                if len(cand.setdefault(ident, [])) >= max_per_ident:
+                    break
+                f = int(fl[k])
+                cand[ident].append((f, float(xs[k]), float(ys[k]), float(ss[k])))
+
+        if not cand:
+            return {}
+
+        # Decode needed frames using PyAV as BGR
+        needed = {}
+        for ident, lst in cand.items():
+            for (fi, x, y, s) in lst:
+                needed.setdefault(int(fi), []).append((ident, x, y, s))
+
+        try:
+            container = av.open(video_path)
+        except Exception as e:
+            raise RuntimeError(f'Failed to open video for MagFace avatars: {video_path}') from e
+
+        # Helper: crop ROI around (x,y,s) with same logic as visualization
+        def _crop_bgr(img_bgr: _np.ndarray, x: float, y: float, s: float, cs: float) -> _np.ndarray:
+            H, W = img_bgr.shape[:2]
+            bsi = int(s * (1 + 2 * cs))
+            pad = 110
+            fr = _np.pad(img_bgr, ((bsi,bsi),(bsi,bsi),(0,0)), mode='constant', constant_values=pad)
+            my = y + bsi; mx = x + bsi
+            y1 = int(my - s); y2 = int(my + s * (1 + 2 * cs))
+            x1 = int(mx - s * (1 + cs)); x2 = int(mx + s * (1 + cs))
+            if y2 <= y1 or x2 <= x1:
+                return None
+            face = fr[y1:y2, x1:x2]
+            if face.size == 0:
+                return None
+            return _cv.resize(face, (224,224))
+
+        # Collect crops per identity
+        crops = {k: [] for k in cand.keys()}
+        try:
+            fidx = -1
+            for frame in container.decode(video=0):
+                fidx += 1
+                lst = needed.get(fidx)
+                if not lst:
+                    continue
+                bgr = frame.to_ndarray(format='bgr24')
+                for (ident, x, y, s) in lst:
+                    roi = _crop_bgr(bgr, x, y, s, float(getattr(args, 'cropScale', 0.40)))
+                    if roi is not None:
+                        crops[ident].append(roi)
+        finally:
+            container.close()
+
+        # Build aligned faces and select best by MagFace magnitude
+        embedder = MagFaceEmbedder(device='cuda', batch_size=16, backbone=os.environ.get('MAGFACE_BACKBONE', 'iresnet100'))
+        out = {}
+        for ident, imgs in crops.items():
+            if not imgs:
+                continue
+            tensors = []
+            aligned_store = []
+            for img in imgs:
+                t = embedder._align_and_preprocess(img)
+                if t is not None:
+                    tensors.append(t)
+                    aligned_store.append(img)  # keep original in case alignment fails for all
+            if not tensors:
+                continue
+            batch = torch.stack(tensors, dim=0).to(embedder.device)
+            with torch.no_grad():
+                raw = embedder.model(batch)  # (N,512)
+                mags = torch.norm(raw, p=2, dim=1)  # (N,)
+            idx = int(torch.argmax(mags).item())
+            # Reconstruct aligned RGB from preprocessed tensor
+            best = tensors[idx].cpu().numpy()  # CHW float [0,1], RGB
+            rgb = (best.transpose(1,2,0) * 255.0).clip(0,255).astype(_np.uint8)
+            out[ident] = rgb
+        return out
+
     # Memory identities: all unique non-None identities present in tracks
     mem_idents = []
     seen = set()
@@ -2838,6 +2955,21 @@ def render_side_panel_skia(base_video_path: str,
         seen.add(ident)
         mem_idents.append(ident)
     mem_idents.sort()
+
+    # Strictly reuse cached high-quality avatars produced during clustering
+    avatars_cache_path = os.path.join(args.pyworkPath, 'identity_avatars_magface.pckl')
+    if not os.path.isfile(avatars_cache_path):
+        raise RuntimeError(f"Missing identity avatars cache: {avatars_cache_path}. Run clustering to generate avatars.")
+    try:
+        import pickle
+        with open(avatars_cache_path, 'rb') as f:
+            avatars = pickle.load(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load avatars cache: {avatars_cache_path}") from e
+    # Validate all required identities exist
+    missing = [ident for ident in set(mem_idents) if ident not in avatars]
+    if missing:
+        raise RuntimeError(f"Avatars missing for identities: {missing}. Re-run clustering to regenerate avatars cache.")
 
     # Build messages timeline
     msgs = []
@@ -2974,20 +3106,27 @@ def render_side_panel_skia(base_video_path: str,
             h = max(avatar_d, text_h) + card_pad_v*2
             heights.append(h)
         total_h = sum(heights) + card_gap * (len(heights) - 1)
-        # Ensure chat area starts after memory block and ends above bottom padding
+        # Chat viewport (clip) below memory block
         y_top = mem_h + pad
-        y_post = max(y_top, panel_h - pad - total_h)
-        # Slide-up animation when a new message arrives: smoothly shift stack upward
+        chat_rect = skia.Rect.MakeLTRB(0, y_top, panel_w, panel_h - pad)
+        # Base top position that bottom-aligns the stack within viewport (fully visible)
+        y_base = panel_h - pad - total_h
+        if y_base < y_top:
+            y_base = y_top
+        # Slide-up animation: move entire stack upward (never downward), so newest始终完整可见
         slide_dur = 0.25
-        y = y_post
+        s = 0.0
         if len(vis) >= 1:
             newest = vis[-1]
-            # Height of newest card
             h_new = heights[-1]
-            # Progress from 0..1 since newest.start
             p = ease_out_cubic((t - float(newest['start'])) / slide_dur) if t >= float(newest['start']) else 0.0
-            # Before the newest settles, the whole stack is offset downward by (1-p)*(h_new+gap)
-            y += (1.0 - p) * (h_new + (card_gap if len(vis) > 1 else 0))
+            # available slack so upward shift won't clip within viewport
+            slack = max(0.0, (panel_h - pad) - (y_base + total_h))
+            want = float(h_new + (card_gap if len(vis) > 1 else 0))
+            s = (1.0 - p) * min(want, slack)
+        canvas.save()
+        canvas.clipRect(chat_rect, doAntiAlias=True)
+        y = y_base - s
         # Draw each card
         for i, m in enumerate(vis):
             h = heights[i]
@@ -3072,6 +3211,7 @@ def render_side_panel_skia(base_video_path: str,
 
             # next y
             y += h + card_gap
+        canvas.restore()
 
     # Render frames
     try:
@@ -3837,9 +3977,13 @@ def process_video():
     minimal = dict(videoFilePath=args.videoFilePath, pyaviPath=args.pyaviPath, pretrainModel=args.pretrainModel, cropScale=args.cropScale, asdBatch=int(getattr(args,'asdBatch',64)), videoFps=float(args.videoFps))
     results = []
     if scene_tasks:
-        if int(getattr(args,'sceneWorkers',6)) > 1:
+        # When multiple GPUs are available, defer parallelism to DataParallel inside
+        # evaluate_network_in_memory to avoid oversubscribing the same GPUs across processes.
+        multi_gpu = (torch.cuda.device_count() > 1)
+        eff_workers = 1 if multi_gpu else int(getattr(args,'sceneWorkers',6))
+        if eff_workers > 1:
             ctx = mp.get_context('spawn')
-            with ctx.Pool(processes=int(getattr(args,'sceneWorkers',6))) as pool:
+            with ctx.Pool(processes=eff_workers) as pool:
                 for idxs, sc_scores in pool.map(_asd_scene_worker, [(idxs, tr_sub, s_f, e_f, minimal) for (idxs,tr_sub,s_f,e_f) in scene_tasks]):
                     results.append((idxs, sc_scores))
         else:
@@ -3885,6 +4029,7 @@ def process_video():
             scores_list=scores if 'scores' in locals() else None,
             batch_size=int(getattr(args, 'idBatch', 64)),
             face_sim_thresh=0.50,
+            save_avatars_path=os.path.join(args.pyworkPath, 'identity_avatars_magface.pckl'),
         )
         with open(identity_tracks_path, 'wb') as fil:
             pickle.dump(annotated_tracks, fil)

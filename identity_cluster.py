@@ -132,6 +132,7 @@ def cluster_visual_identities(
     asd_score_thresh: float = 0.20,
     asd_min_consec: int = 8,
     asd_min_ratio: float = 0.10,
+    save_avatars_path: Optional[str] = None,
 ) -> List[Dict]:
     """Cluster face tracks into stable episode-level identities using only visual cues.
 
@@ -149,6 +150,8 @@ def cluster_visual_identities(
     # 1) Per-track embedding (single prototype per track)
     embedder = _build_embedder(device=device, batch_size=batch_size)
     embs: List[Optional[torch.Tensor]] = []  # (1,D) per track or None
+    # Track-level best aligned face and its quality (mag)
+    track_best: Dict[int, Dict[str, object]] = {}
     valid_idx: List[int] = []
     # Scheme A: skip tracks with no positive ASD frames when scores_list provided
     include_track = [True] * len(vidTracks)
@@ -186,6 +189,8 @@ def cluster_visual_identities(
             continue
         crop_file = tr.get("cropFile")
         emb = None
+        best_img = None
+        best_mag = None
         # Active indices from ASD gating
         active_idx = None
         if scores_list is not None and i < len(scores_list):
@@ -194,14 +199,41 @@ def cluster_visual_identities(
                 idx = [k for k, v in enumerate(sc) if float(v) > asd_score_thresh]
                 if len(idx) > 0:
                     active_idx = idx
-        # 1) If crop file exists, use file-based embedding
+        # 1) If crop file exists, open video and compute aligned frames for quality + embedding
         if crop_file:
             avi_path = crop_file + ".avi"
             if os.path.isfile(avi_path):
-                if hasattr(embedder, "track_embedding"):
-                    emb = embedder.track_embedding(avi_path, active_indices=active_idx)
-                else:
-                    emb = embedder._track_embedding(avi_path, active_indices=active_idx)
+                import cv2 as _cv
+                cap = _cv.VideoCapture(avi_path)
+                total = int(cap.get(_cv.CAP_PROP_FRAME_COUNT))
+                if total > 0:
+                    # select sample indices
+                    positions = _sample_indices(total, active_idx, max_samples=15)
+                    tensors = []
+                    align_src = []
+                    for pos in positions:
+                        cap.set(_cv.CAP_PROP_POS_FRAMES, int(pos))
+                        ret, frame = cap.read()
+                        if not ret:
+                            continue
+                        t = embedder._align_and_preprocess(frame)
+                        if t is not None:
+                            tensors.append(t)
+                            align_src.append(t)  # store aligned tensor for thumbnail
+                    cap.release()
+                    if tensors:
+                        batch = torch.stack(tensors, dim=0).to(embedder.device)
+                        out = embedder.model(batch)
+                        mags = torch.norm(out, p=2, dim=1)
+                        out_n = F.normalize(out, p=2, dim=1)
+                        # weighted average embedding as before
+                        w = mags.view(-1,1)
+                        emb = F.normalize((out_n * w).sum(dim=0, keepdim=True) / (w.sum() + 1e-8), p=2, dim=1)
+                        # best aligned image by mag
+                        j = int(torch.argmax(mags).item())
+                        best_mag = float(mags[j].item())
+                        at = align_src[j].cpu().numpy()  # CHW float
+                        best_img = (at.transpose(1,2,0) * 255.0).clip(0,255).astype(np.uint8)
         # 2) Otherwise, build frames from original video + proc_track and embed in-memory
         if emb is None:
             video_path = tr.get('video_path') or tr.get('videoFilePath')
@@ -231,11 +263,29 @@ def cluster_visual_identities(
                     frames_bgr.append(face)
             cap.release()
             if frames_bgr:
-                if hasattr(embedder, 'track_embedding_from_frames'):
-                    emb = embedder.track_embedding_from_frames(frames_bgr, active_indices=None)
+                # Align & forward to get mags and embedding
+                tensors = []
+                for fb in frames_bgr:
+                    t = embedder._align_and_preprocess(fb)
+                    if t is not None:
+                        tensors.append(t)
+                if tensors:
+                    batch = torch.stack(tensors, dim=0).to(embedder.device)
+                    out = embedder.model(batch)
+                    mags = torch.norm(out, p=2, dim=1)
+                    out_n = F.normalize(out, p=2, dim=1)
+                    w = mags.view(-1,1)
+                    emb = F.normalize((out_n * w).sum(dim=0, keepdim=True) / (w.sum() + 1e-8), p=2, dim=1)
+                    j = int(torch.argmax(mags).item())
+                    best_mag = float(mags[j].item())
+                    at = tensors[j].cpu().numpy()
+                    best_img = (at.transpose(1,2,0) * 255.0).clip(0,255).astype(np.uint8)
         if emb is None:
             embs.append(None)
             continue
+        # Save best for this track if available
+        if isinstance(best_img, np.ndarray) and best_img.size > 0 and (best_mag is not None):
+            track_best[i] = { 'img': best_img, 'mag': float(best_mag) }
         embs.append(emb)
         valid_idx.append(i)
 
@@ -380,5 +430,37 @@ def cluster_visual_identities(
         else:
             t2["identity"] = None
         annotated.append(t2)
+
+    # 8) Build per-identity best avatar (reuse MagFace quality) and optionally persist
+    if save_avatars_path:
+        id_best = {}
+        for gid in active:
+            members = groups[gid]
+            # find member with highest best_mag
+            best = None
+            best_m = -1.0
+            for m in members:
+                rec = track_best.get(m)
+                if not rec:
+                    continue
+                if float(rec['mag']) > best_m:
+                    best_m = float(rec['mag'])
+                    best = rec['img']
+            if best is None:
+                continue
+            label = None
+            # find label for this group
+            for k,v in stable_ids.items():
+                if k in members:
+                    label = v; break
+            if isinstance(label, str):
+                id_best[label] = best
+        if id_best:
+            try:
+                import pickle
+                with open(save_avatars_path, 'wb') as f:
+                    pickle.dump(id_best, f)
+            except Exception:
+                pass
 
     return annotated
