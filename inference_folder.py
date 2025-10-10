@@ -37,13 +37,54 @@ except Exception:
 
 warnings.filterwarnings("ignore")
 
+def _ensure_cfr25(input_path: str, output_path: str, start: float = 0.0, duration: float = 0.0, threads: int = 4):
+    """Top-level helper to re-encode input to 25fps CFR H.264 MP4.
+    Maintains exact quality settings used elsewhere (libx264, CRF=18, veryfast).
+    """
+    ss_to = ''
+    if duration and duration > 0:
+        ss_to = f" -ss {start:.3f} -to {start+duration:.3f}"
+    cmd = (
+        f"ffmpeg -y -i {input_path}{ss_to} -r 25 -vsync cfr -pix_fmt yuv420p "
+        f"-c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k -threads {int(threads)} {output_path} -loglevel panic"
+    )
+    return subprocess.call(cmd, shell=True, stdout=None)
+
+def _ffmpeg_dual_worker(task):
+    """Top-level worker for ffmpeg tasks used with multiprocessing.
+
+    task: tuple(kind, payload)
+      - ('cfr', (in_path, out_path, start, duration, threads))
+      - ('aud', (in_path, out_wav, start, duration, threads))
+    Returns: (kind, rc)
+    """
+    kind, payload = task
+    try:
+        if kind == 'cfr':
+            in_p, out_p, st, du, th = payload
+            return ('cfr', _ensure_cfr25(in_p, out_p, float(st), float(du), int(th)))
+        elif kind == 'aud':
+            in_p, out_wav, st, du, th = payload
+            ss_to = ''
+            if du and float(du) > 0:
+                ss_to = f" -ss {float(st):.3f} -to {float(st)+float(du):.3f}"
+            cmd = (
+                f"ffmpeg -y -i {in_p}{ss_to} -c:a pcm_s16le -ac 1 -vn -threads {int(th)} -ar 16000 {out_wav} -loglevel panic"
+            )
+            rc = subprocess.call(cmd, shell=True, stdout=None)
+            return ('aud', rc)
+        else:
+            return (kind, 1)
+    except Exception:
+        return (kind, 1)
+
 parser = argparse.ArgumentParser(description = "Demo")
 
 # parser.add_argument('--videoName',             type=str, default="001",   help='Demo video name')
 parser.add_argument('--videoFolder',           type=str, default="/workspace/siyuan/siyuan/whisperv_proj/data/video/Frasier",  help='Path for inputs, tmps and outputs')
 parser.add_argument('--pretrainModel',         type=str, default="pretrain_TalkSet.model",   help='Path for the pretrained TalkNet model')
 
-parser.add_argument('--nDataLoaderThread',     type=int,   default=4,   help='Number of workers')
+parser.add_argument('--nDataLoaderThread',     type=int,   default=-1,   help='FFmpeg/IO threads (-1 = auto CPU count)')
 parser.add_argument('--facedetScale',          type=float, default=0.25, help='Scale factor for face detection, the frames will be scale to 0.25 orig')
 parser.add_argument('--minTrack',              type=int,   default=10,   help='Number of min frames for each shot')
 parser.add_argument('--numFailedDet',          type=int,   default=10,   help='Number of missed detections allowed before tracking is stopped')
@@ -52,9 +93,9 @@ parser.add_argument('--cropScale',             type=float, default=0.40, help='S
 
 parser.add_argument('--start',                 type=int, default=0,   help='The start time of the video')
 parser.add_argument('--duration',              type=int, default=0,  help='The duration of the video, when set as 0, will extract the whole video')
-parser.add_argument('--facedetBatch',         type=int,   default=128,  help='Batch size for S3FD face detection (increase on 24GB GPUs)')
-parser.add_argument('--idBatch',              type=int,   default=64,   help='Batch size for identity embedding (MagFace/Facenet)')
-parser.add_argument('--asdBatch',             type=int,   default=64,   help='Batch size for ASD window inference')
+parser.add_argument('--facedetBatch',         type=int,   default=-1,  help='Batch size for S3FD face detection (-1 = auto max)')
+parser.add_argument('--idBatch',              type=int,   default=-1,   help='Batch size for identity embedding (-1 = auto max)')
+parser.add_argument('--asdBatch',             type=int,   default=-1,   help='Batch size for ASD window inference (-1 = auto max)')
 parser.add_argument('--cropWorkers',          type=int,   default=8,    help='Parallel workers for audio cut + mux per track')
 parser.add_argument('--sceneWorkers',         type=int,   default=6,    help='Parallel workers for in-memory ASD by scene')
 parser.add_argument('--sceneMinSec',         type=float, default=1.0,  help='Minimum scene length in seconds (detector min_scene_len)')
@@ -67,6 +108,45 @@ parser.add_argument('--panelTheme',          type=str,   default='glass', choice
 parser.add_argument('--panelCompose',        type=str,   default='raw', choices=['subtitles','raw'], help='Compose panel onto which base: subtitles or raw video')
 
 args, unknown  = parser.parse_known_args()
+
+def _auto_set_max_batches(a):
+    """Set large batch sizes by default when user didn't specify (-1)."""
+    try:
+        ng = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        ng = 0
+    if ng <= 0:
+        if getattr(a, 'facedetBatch', 0) <= 0:
+            a.facedetBatch = 128
+        if getattr(a, 'idBatch', 0) <= 0:
+            a.idBatch = 128
+        if getattr(a, 'asdBatch', 0) <= 0:
+            a.asdBatch = 128
+        return a
+    if getattr(a, 'facedetBatch', 0) <= 0:
+        a.facedetBatch = int(min(2048, 256 * ng))
+    if getattr(a, 'idBatch', 0) <= 0:
+        a.idBatch = int(min(4096, 256 * ng))
+    if getattr(a, 'asdBatch', 0) <= 0:
+        a.asdBatch = int(min(4096, 256 * ng))
+    return a
+
+args = _auto_set_max_batches(args)
+
+def _auto_ffmpeg_threads(a):
+    try:
+        th = int(getattr(a, 'nDataLoaderThread', -1))
+    except Exception:
+        th = -1
+    if th is None or th <= 0:
+        try:
+            import os
+            a.nDataLoaderThread = max(1, int(os.cpu_count() or 8))
+        except Exception:
+            a.nDataLoaderThread = 8
+    return a
+
+args = _auto_ffmpeg_threads(args)
 
 if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
     Link = "1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea"
@@ -554,7 +634,7 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
 
     # 3) TalkNet ASD with cross-track batching per duration
     s = talkNet(); s.loadParameters(args.pretrainModel); s.eval()
-    # Enable multi-GPU inference via DataParallel when multiple GPUs are available.
+    # Multi-GPU: simple DataParallel across all visible devices
     use_dp = (torch.cuda.device_count() > 1)
     dp_model = torch.nn.DataParallel(s) if use_dp else None
     durationU = [1,2,3,4,5,6]
@@ -1000,6 +1080,9 @@ def evaluate_network(files, args):
     s.loadParameters(args.pretrainModel)
     sys.stderr.write("Model %s loaded from previous state! \r\n"%args.pretrainModel)
     s.eval()
+    # Multi-GPU: simple DataParallel across all visible devices
+    use_dp = (torch.cuda.device_count() > 1)
+    dp_model = torch.nn.DataParallel(s) if use_dp else None
     allScores = []
     # durationSet = {1,2,4,6}
     durationSet = {1,1,1,2,2,2,3,3,4,5,6}
@@ -1048,13 +1131,17 @@ def evaluate_network(files, args):
                     j = min(n_full, i + B)
                     batchA = [audioFeature[k * winA:(k + 1) * winA, :] for k in range(i, j)]
                     batchV = [videoFeature[k * winV:(k + 1) * winV, :, :] for k in range(i, j)]
-                    inputA = torch.FloatTensor(numpy.stack(batchA, axis=0)).cuda()
-                    inputV = torch.FloatTensor(numpy.stack(batchV, axis=0)).cuda()
-
-                    embedA = s.model.forward_audio_frontend(inputA)
-                    embedV = s.model.forward_visual_frontend(inputV)
-                    embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
-                    out = s.model.forward_audio_visual_backend(embedA, embedV)
+                    if use_dp:
+                        inputA = torch.from_numpy(numpy.stack(batchA, axis=0).astype(numpy.float32))
+                        inputV = torch.from_numpy(numpy.stack(batchV, axis=0).astype(numpy.float32))
+                        out = dp_model(inputA, inputV)
+                    else:
+                        inputA = torch.FloatTensor(numpy.stack(batchA, axis=0)).cuda()
+                        inputV = torch.FloatTensor(numpy.stack(batchV, axis=0)).cuda()
+                        embedA = s.model.forward_audio_frontend(inputA)
+                        embedV = s.model.forward_visual_frontend(inputV)
+                        embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
+                        out = s.model.forward_audio_visual_backend(embedA, embedV)
                     scoreBatch = s.lossAV.forward(out, labels=None)  # (B*T,)
                     scoreBatch = numpy.asarray(scoreBatch)
                     # Split back per window (equal length since full windows)
@@ -1073,12 +1160,17 @@ def evaluate_network(files, args):
                     a_tail = audioFeature[k * winA: (k + 1) * winA, :]
                     v_tail = videoFeature[k * winV: (k + 1) * winV, :, :]
                     if a_tail.shape[0] > 0 and v_tail.shape[0] > 0:
-                        inputA = torch.FloatTensor(a_tail).unsqueeze(0).cuda()
-                        inputV = torch.FloatTensor(v_tail).unsqueeze(0).cuda()
-                        embedA = s.model.forward_audio_frontend(inputA)
-                        embedV = s.model.forward_visual_frontend(inputV)
-                        embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
-                        out = s.model.forward_audio_visual_backend(embedA, embedV)
+                        if use_dp:
+                            inputA = torch.from_numpy(a_tail.astype(numpy.float32)).unsqueeze(0)
+                            inputV = torch.from_numpy(v_tail.astype(numpy.float32)).unsqueeze(0)
+                            out = dp_model(inputA, inputV)
+                        else:
+                            inputA = torch.FloatTensor(a_tail).unsqueeze(0).cuda()
+                            inputV = torch.FloatTensor(v_tail).unsqueeze(0).cuda()
+                            embedA = s.model.forward_audio_frontend(inputA)
+                            embedV = s.model.forward_visual_frontend(inputV)
+                            embedA, embedV = s.model.forward_cross_attention(embedA, embedV)
+                            out = s.model.forward_audio_visual_backend(embedA, embedV)
                         score_tail = s.lossAV.forward(out, labels=None)
                         # Append per-step tail predictions (1 window)
                         try:
@@ -1430,11 +1522,34 @@ def _to_diarize_df(diarize_segments):
     raise TypeError(f"Unsupported diarization type: {type(diarize_segments)}")
 
 
+def _best_visible_cuda_index() -> int:
+    try:
+        if not torch.cuda.is_available():
+            return -1
+        best_i = 0
+        best_free = -1
+        for i in range(torch.cuda.device_count()):
+            try:
+                free, _ = torch.cuda.mem_get_info(i)
+            except Exception:
+                free = 0
+            if free > best_free:
+                best_free = free
+                best_i = i
+        return int(best_i)
+    except Exception:
+        return 0
+
 def speech_diarization(min_speakers: int = None, max_speakers: int = None):
-    # device = "cpu"
-    device = "cuda"
+    # Choose the visible CUDA device with most free memory for ASR to avoid OOM
+    dev_idx = _best_visible_cuda_index()
+    device = "cuda" if dev_idx >= 0 else "cpu"
     audio_file = os.path.join(args.pyaviPath, "audio.wav")
-    batch_size = 32 # reduce if low on GPU mem
+    # Keep conservative batch by default; allow override via env WHISPERX_BATCH
+    try:
+        batch_size = int(os.environ.get('WHISPERX_BATCH', '8') or 8)
+    except Exception:
+        batch_size = 8
     compute_type = "int8"  # use int8 for lower memory with large model
 
     # 1. Transcribe
@@ -1448,11 +1563,11 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
             from transformers import pipeline as hf_pipeline
         except Exception as e:
             raise RuntimeError("Transformers not available but USE_TRANSFORMERS_ASR requested") from e
-        dev_idx = 0 if device == "cuda" else -1
+        dev_idx_tf = (dev_idx if dev_idx >= 0 else -1)
         asr = hf_pipeline(
             "automatic-speech-recognition",
             model=(model_name if model_name else "BELLE-2/Belle-whisper-large-v3-zh"),
-            device=dev_idx,
+            device=dev_idx_tf,
             chunk_length_s=30,
             stride_length_s=6,
         )
@@ -1498,7 +1613,12 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
         print(result.get("segments", []))
     else:
         # WhisperX internal loader (faster-whisper / ct2)
-        model = whisperx.load_model(model_name, device, compute_type=compute_type)
+        # faster-whisper/ctranslate2 expects device like 'cuda' and a separate device_index
+        try:
+            model = whisperx.load_model(model_name, device, compute_type=compute_type, device_index=(dev_idx if dev_idx >= 0 else 0))
+        except TypeError:
+            # For older whisperx that doesn't take device_index kw, fall back to device only
+            model = whisperx.load_model(model_name, device, compute_type=compute_type)
         audio = whisperx.load_audio(audio_file)
         result = model.transcribe(audio, batch_size=batch_size)
         print(result.get("segments", []))  # before alignment
@@ -2918,7 +3038,12 @@ def render_side_panel_skia(base_video_path: str,
             container.close()
 
         # Build aligned faces and select best by MagFace magnitude
-        embedder = MagFaceEmbedder(device='cuda', batch_size=16, backbone=os.environ.get('MAGFACE_BACKBONE', 'iresnet100'))
+        # Use the same batch sizing policy as identity embedding elsewhere
+        try:
+            _idb = int(getattr(args, 'idBatch', 64))
+        except Exception:
+            _idb = 64
+        embedder = MagFaceEmbedder(device='cuda', batch_size=_idb, backbone=os.environ.get('MAGFACE_BACKBONE', 'iresnet100'))
         out = {}
         for ident, imgs in crops.items():
             if not imgs:
@@ -3752,17 +3877,8 @@ def process_video():
     # Extract video
     # Re-encode input to constant 25fps for robust, consistent timeline
     args.videoFilePath = os.path.join(args.pyaviPath, 'video.mp4')
-    def _ensure_cfr25(input_path: str, output_path: str, start: float = 0.0, duration: float = 0.0, threads: int = 4):
-        import subprocess, os
-        # Always produce 25fps CFR H.264 MP4 with audio preserved
-        ss_to = ''
-        if duration and duration > 0:
-            ss_to = f" -ss {start:.3f} -to {start+duration:.3f}"
-        cmd = (
-            f"ffmpeg -y -i {input_path}{ss_to} -r 25 -vsync cfr -pix_fmt yuv420p "
-            f"-c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k -threads {int(threads)} {output_path} -loglevel panic"
-        )
-        return subprocess.call(cmd, shell=True, stdout=None)
+
+    # (moved _ensure_cfr25 and _ffmpeg_dual_worker to module scope for pickling)
 
     need_encode = True
     if os.path.exists(args.videoFilePath):
@@ -3788,26 +3904,47 @@ def process_video():
             need_encode = abs(eff - 25.0) > 0.01
         except Exception:
             need_encode = True
+    # Run CFR re-encode and audio extraction in parallel (no quality change)
+    force_rebuild = need_encode
+    args.audioFilePath = os.path.join(args.pyaviPath, 'audio.wav')
+    tasks = []
     if need_encode:
         print("Re-encoding input to 25fps CFR...")
-        rc = _ensure_cfr25(args.videoPath, args.videoFilePath, float(args.start), float(args.duration) if args.duration else 0.0, int(args.nDataLoaderThread))
-        if rc != 0:
-            raise RuntimeError("Failed to re-encode input to 25fps for processing")
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Re-encoded the video to 25fps CFR at %s \r\n" %(args.videoFilePath))
+        tasks.append(('cfr', (args.videoPath,
+                              args.videoFilePath,
+                              float(args.start),
+                              float(args.duration) if args.duration else 0.0,
+                              int(args.nDataLoaderThread))))
     else:
         sys.stderr.write("25fps CFR video already exists, skipping re-encode: %s \r\n" % args.videoFilePath)
-    force_rebuild = need_encode
-    
-    # Extract audio
-    args.audioFilePath = os.path.join(args.pyaviPath, 'audio.wav')
+
     if os.path.exists(args.audioFilePath):
         sys.stderr.write("Audio already exists, skipping extraction: %s \r\n" % args.audioFilePath)
     else:
-        print("Extracting audio...")
-        command = ("ffmpeg -y -i %s -c:a pcm_s16le -ac 1 -vn -threads %d -ar 16000 %s -loglevel panic" % \
-            (args.videoFilePath, args.nDataLoaderThread, args.audioFilePath))
-        subprocess.call(command, shell=True, stdout=None)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Extract the audio and save in %s \r\n" %(args.audioFilePath))
+        print("Extracting audio in parallel...")
+        # Extract audio (trim if start/duration specified) directly from ORIGINAL input
+        tasks.append(('aud', (args.videoPath,
+                              args.audioFilePath,
+                              float(args.start),
+                              float(args.duration) if args.duration else 0.0,
+                              int(args.nDataLoaderThread))))
+
+    if tasks:
+        import torch.multiprocessing as mp
+        ctx = mp.get_context('spawn')
+        with ctx.Pool(processes=len(tasks)) as pool:
+            res = pool.map(_ffmpeg_dual_worker, tasks)
+        # Validate results
+        for kind, rc in res:
+            if rc != 0:
+                if kind == 'cfr':
+                    raise RuntimeError("Failed to re-encode input to 25fps for processing")
+                elif kind == 'aud':
+                    raise RuntimeError("Failed to extract audio to 16k PCM WAV")
+        if need_encode:
+            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Re-encoded the video to 25fps CFR at %s \r\n" %(args.videoFilePath))
+        if not os.path.exists(args.audioFilePath):
+            raise RuntimeError("Audio extraction reported success but output file missing")
 
     # Derive an effective FPS without relying on extracted frames
     def _compute_effective_fps_from_container(audio_wav_path: str, video_path: str) -> float:
@@ -4111,7 +4248,8 @@ def process_video():
         combined = os.path.join(args.pyaviPath, 'video_with_panel.mp4')
         cmd_combine = (
             f"ffmpeg -y -i {base_in} -i {panel_out} -filter_complex \"[0:v][1:v]hstack=inputs=2[v]\" "
-            f"-map \"[v]\" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -c:a aac -b:a 192k -ar 16000 {combined} -loglevel error"
+            f"-map \"[v]\" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -threads {int(args.nDataLoaderThread)} "
+            f"-c:a aac -b:a 192k -ar 16000 {combined} -loglevel error"
         )
         rc = subprocess.call(cmd_combine, shell=True)
         if rc != 0:

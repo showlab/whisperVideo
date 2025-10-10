@@ -183,6 +183,9 @@ class MagFaceEmbedder:
         state_dict = self._clean_state_dict(net, state['state_dict'])
         net.load_state_dict(state_dict, strict=True)
         self.model = net.eval().to(self.device)
+        # Enable multi-GPU inference for MagFace backbone when available
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
+            self.model = torch.nn.DataParallel(self.model)
 
         # Face alignment via InsightFace landmarks
         try:

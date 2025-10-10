@@ -151,7 +151,9 @@ class Detect(object):
         decoded_boxes = decode(loc_data.view(-1, 4), batch_priors, self.variance)
         decoded_boxes = decoded_boxes.view(num, num_priors, 4)
 
-        output = torch.zeros(num, self.num_classes, self.top_k, 5)
+        # Ensure outputs are on the same device as inputs to be DP-friendly
+        device = loc_data.device
+        output = torch.zeros(num, self.num_classes, self.top_k, 5, device=device)
 
         for i in range(num):
             boxes = decoded_boxes[i].clone()

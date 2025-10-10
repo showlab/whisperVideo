@@ -30,6 +30,9 @@ class IdentityVerifier:
         self.similarity_threshold = similarity_threshold
 
         self.model = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+        # Enable multi-GPU inference for facenet backbone when available
+        if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
+            self.model = torch.nn.DataParallel(self.model)
         self.tf = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((160, 160)),

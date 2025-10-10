@@ -28,6 +28,16 @@ class S3FD():
         state_dict = torch.load(PATH_WEIGHT, map_location=self.device)
         self.net.load_state_dict(state_dict)
         self.net.eval()
+        # Use all available GPUs for face detection when possible.
+        if isinstance(self.device, str):
+            dev_type = self.device
+        else:
+            try:
+                dev_type = self.device.type
+            except Exception:
+                dev_type = 'cpu'
+        if dev_type == 'cuda' and torch.cuda.device_count() > 1:
+            self.net = torch.nn.DataParallel(self.net)
         # print('[S3FD] finished loading (%.4f sec)' % (time.time() - tstamp))
     
     def detect_faces(self, image, conf_th=0.8, scales=[1]):
