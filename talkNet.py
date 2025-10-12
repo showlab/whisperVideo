@@ -99,7 +99,25 @@ class talkNet(nn.Module):
             if selfState[name].size() != loadedState[origName].size():
                 sys.stderr.write("Wrong parameter length: %s, model: %s, loaded: %s"%(origName, selfState[name].size(), loadedState[origName].size()))
                 continue
-        selfState[name].copy_(param)
+            selfState[name].copy_(param)
+
+    def forward(self, inputA: torch.Tensor, inputV: torch.Tensor) -> torch.Tensor:
+        """Inference forward used for DataParallel.
+
+        Expects:
+        - inputA: (B, T_a, 13) float32 tensor
+        - inputV: (B, T_v, 112, 112) float32 tensor
+        Returns:
+        - out: (B*T_step, 256) flattened representation passed to lossAV for scoring
+        Notes:
+        - Do NOT move tensors to device here; DataParallel scatters inputs to replicas.
+        - Matches the exact sequence used in evaluation code paths to preserve outputs.
+        """
+        audioEmbed = self.model.forward_audio_frontend(inputA)
+        visualEmbed = self.model.forward_visual_frontend(inputV)
+        audioEmbed, visualEmbed = self.model.forward_cross_attention(audioEmbed, visualEmbed)
+        out = self.model.forward_audio_visual_backend(audioEmbed, visualEmbed)
+        return out
 
     def forward(self, inputA: torch.Tensor, inputV: torch.Tensor):
         """End-to-end forward used for multi-GPU inference (DataParallel/DDP).

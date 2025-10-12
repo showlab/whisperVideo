@@ -1,4 +1,4 @@
-import sys, time, os, tqdm, torch, argparse, glob, subprocess, warnings, cv2, pickle, numpy, pdb, math, python_speech_features
+import sys, time, os, tqdm, torch, argparse, glob, subprocess, warnings, cv2, pickle, numpy, pdb, math, python_speech_features, json
 import torch.nn.functional as F
 from collections import defaultdict, Counter
 
@@ -36,6 +36,20 @@ except Exception:
     from .identity_cluster import cluster_visual_identities
 
 warnings.filterwarnings("ignore")
+os.environ.setdefault('OPENCV_LOG_LEVEL', 'SILENT')
+try:
+    # Silence OpenCV logs (including FFmpeg backend noise) where possible
+    import cv2 as _cv_quiet
+    if hasattr(_cv_quiet, 'utils') and hasattr(_cv_quiet.utils, 'logging'):
+        _cv_quiet.utils.logging.setLogLevel(_cv_quiet.utils.logging.LOG_LEVEL_SILENT)
+except Exception:
+    pass
+try:
+    import av as _av_quiet  # type: ignore
+    if hasattr(_av_quiet, 'logging'):
+        _av_quiet.logging.set_level(_av_quiet.logging.ERROR)
+except Exception:
+    pass
 
 def _ensure_cfr25(input_path: str, output_path: str, start: float = 0.0, duration: float = 0.0, threads: int = 4):
     """Top-level helper to re-encode input to 25fps CFR H.264 MP4.
@@ -94,6 +108,9 @@ parser.add_argument('--cropScale',             type=float, default=0.40, help='S
 parser.add_argument('--start',                 type=int, default=0,   help='The start time of the video')
 parser.add_argument('--duration',              type=int, default=0,  help='The duration of the video, when set as 0, will extract the whole video')
 parser.add_argument('--facedetBatch',         type=int,   default=-1,  help='Batch size for S3FD face detection (-1 = auto max)')
+parser.add_argument('--detBackend',           type=str,   default='scrfd', choices=['s3fd','scrfd'], help='Face detector backend: s3fd (PyTorch) or scrfd (InsightFace ONNX)')
+parser.add_argument('--detInputW',            type=int,   default=288, help='Detector input width for SCRFD (resized decode via decord)')
+parser.add_argument('--detInputH',            type=int,   default=160, help='Detector input height for SCRFD (resized decode via decord)')
 parser.add_argument('--idBatch',              type=int,   default=-1,   help='Batch size for identity embedding (-1 = auto max)')
 parser.add_argument('--asdBatch',             type=int,   default=-1,   help='Batch size for ASD window inference (-1 = auto max)')
 parser.add_argument('--cropWorkers',          type=int,   default=8,    help='Parallel workers for audio cut + mux per track')
@@ -104,8 +121,14 @@ parser.add_argument('--sceneMinSec',         type=float, default=1.0,  help='Min
 parser.add_argument('--renderPanel',         action='store_true', default=True, help='Render a Skia side panel with identity chat-like messages (default on)')
 parser.add_argument('--panelWidthRatio',     type=float, default=0.28, help='Right panel width ratio relative to video width (0.2–0.4 recommended)')
 parser.add_argument('--panelMaxItems',       type=int,   default=6,    help='Max messages to show in panel')
+parser.add_argument('--panelWorkers',        type=int,   default=1,    help='Parallel workers for panel rendering (CPU, torch.multiprocessing)')
 parser.add_argument('--panelTheme',          type=str,   default='glass', choices=['glass','dark'], help='Panel theme style')
 parser.add_argument('--panelCompose',        type=str,   default='raw', choices=['subtitles','raw'], help='Compose panel onto which base: subtitles or raw video')
+
+# Diarization parallelization
+parser.add_argument('--diarWorkers',         type=int,   default=1,    help='Parallel workers for diarization (GPU, torch.multiprocessing)')
+parser.add_argument('--diarWindowSec',       type=float, default=60.0, help='Diarization window length in seconds')
+parser.add_argument('--diarOverlapSec',      type=float, default=3.0,  help='Diarization window overlap in seconds')
 
 args, unknown  = parser.parse_known_args()
 
@@ -152,6 +175,57 @@ if os.path.isfile(args.pretrainModel) == False: # Download the pretrained model
     Link = "1AbN9fCf9IexMxEKXLQY2KYBlb-IhSEea"
     cmd = "gdown --id %s -O %s"%(Link, args.pretrainModel)
     subprocess.call(cmd, shell=True, stdout=None)
+
+
+class _StageTimer:
+    """Append-only JSONL timing logger.
+
+    Usage:
+        timer = _StageTimer(log_path, meta)
+        with timer.timer('stage_name'):
+            ...
+        # or timer.record(name, start, end)
+    """
+    def __init__(self, log_path: str, meta: dict | None = None):
+        self.log_path = os.path.abspath(log_path)
+        self.meta = dict(meta or {})
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+
+    class _Ctx:
+        def __init__(self, parent, name: str, extra: dict | None = None):
+            self.parent = parent
+            self.name = name
+            self.extra = dict(extra or {})
+            self.t0 = None
+        def __enter__(self):
+            self.t0 = time.perf_counter()
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            t1 = time.perf_counter()
+            self.parent.record(self.name, self.t0, t1, self.extra)
+
+    def timer(self, name: str, extra: dict | None = None):
+        return _StageTimer._Ctx(self, name, extra)
+
+    def record(self, name: str, start: float, end: float, extra: dict | None = None):
+        rec = {
+            'stage': str(name),
+            'ts_start': float(start),
+            'ts_end': float(end),
+            'elapsed_sec': float(max(0.0, end - start)),
+        }
+        if isinstance(self.meta, dict):
+            rec.update(self.meta)
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                if k not in rec:
+                    rec[k] = v
+        try:
+            with open(self.log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            # Must not break pipeline
+            pass
 
 
 def _ensure_chinese_font():
@@ -221,47 +295,158 @@ def scene_detect(args):
     return sceneList
 
 def inference_video(args):
-    # GPU: Face detection from container video stream with torch batch processing
-    DET = S3FD(device='cuda')
-    cap = cv2.VideoCapture(args.videoFilePath)
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video for detection: {args.videoFilePath}")
+    # GPU: Face detection from container video stream
+    if str(getattr(args, 'detBackend', 's3fd')).lower() == 's3fd':
+        # Legacy S3FD path (PyTorch)
+        DET = S3FD(device='cuda')
+        cap = cv2.VideoCapture(args.videoFilePath)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video for detection: {args.videoFilePath}")
 
-    dets = []
-    fidx = 0
-    batch_imgs = []
-    batch_idx = []
-    B = max(1, int(args.facedetBatch))
-
-    def flush_batch():
-        nonlocal batch_imgs, batch_idx, dets
-        if not batch_imgs:
-            return
-        # Run batched S3FD on RGB images
-        batched_boxes = DET.detect_faces_batch(batch_imgs, conf_th=0.9, scales=[args.facedetScale])
-        for local_i, boxes in enumerate(batched_boxes):
-            fi = batch_idx[local_i]
-            frame_dets = []
-            for bbox in boxes:
-                frame_dets.append({'frame': fi, 'bbox': (bbox[:-1]).tolist(), 'conf': float(bbox[-1])})
-            dets.append(frame_dets)
-            if fi % 50 == 0:
-                sys.stderr.write('%s-%05d; %d dets\r' % (args.videoFilePath, fi, len(frame_dets)))
+        dets = []
+        fidx = 0
         batch_imgs = []
         batch_idx = []
+        B = max(1, int(args.facedetBatch))
 
-    while True:
-        ret, image = cap.read()
-        if not ret:
-            break
-        imageNumpy = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        batch_imgs.append(imageNumpy)
-        batch_idx.append(fidx)
-        if len(batch_imgs) >= B:
-            flush_batch()
-        fidx += 1
-    cap.release()
-    flush_batch()
+        def flush_batch():
+            nonlocal batch_imgs, batch_idx, dets
+            if not batch_imgs:
+                return
+            batched_boxes = DET.detect_faces_batch(batch_imgs, conf_th=0.9, scales=[args.facedetScale])
+            for local_i, boxes in enumerate(batched_boxes):
+                fi = batch_idx[local_i]
+                frame_dets = []
+                for bbox in boxes:
+                    frame_dets.append({'frame': fi, 'bbox': (bbox[:-1]).tolist(), 'conf': float(bbox[-1])})
+                dets.append(frame_dets)
+                if fi % 50 == 0:
+                    sys.stderr.write('%s-%05d; %d dets\r' % (args.videoFilePath, fi, len(frame_dets)))
+            batch_imgs = []
+            batch_idx = []
+
+        while True:
+            ret, image = cap.read()
+            if not ret:
+                break
+            imageNumpy = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            batch_imgs.append(imageNumpy)
+            batch_idx.append(fidx)
+            if len(batch_imgs) >= B:
+                flush_batch()
+            fidx += 1
+        cap.release()
+        flush_batch()
+        savePath = os.path.join(args.pyworkPath, 'faces.pckl')
+        with open(savePath, 'wb') as fil:
+            pickle.dump(dets, fil)
+        return dets
+
+    # Optimized SCRFD path with decord decode at reduced resolution
+    try:
+        import decord  # type: ignore
+        import insightface  # type: ignore
+    except Exception as e:
+        raise RuntimeError('SCRFD detection requires decord and insightface. Please install them.') from e
+
+    # Video properties for box scaling back to original resolution
+    try:
+        W0, H0, _fps, _dur = _ffprobe_video_props(args.videoFilePath)
+    except Exception:
+        cap0 = cv2.VideoCapture(args.videoFilePath)
+        if not cap0.isOpened():
+            raise RuntimeError(f"Failed to open video for detection: {args.videoFilePath}")
+        W0 = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        H0 = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cap0.release()
+        if W0 <= 0 or H0 <= 0:
+            raise RuntimeError('Unable to determine video resolution for scaling face boxes')
+
+    in_w = int(getattr(args, 'detInputW', 288)); in_h = int(getattr(args, 'detInputH', 160))
+    scale_x = float(W0) / float(in_w)
+    scale_y = float(H0) / float(in_h)
+
+    # Build SCRFD detector (ONNXRuntime CUDA)
+    fa = insightface.app.FaceAnalysis(name='buffalo_sc', providers=['CUDAExecutionProvider'], provider_options=[{"device_id": 0}], allowed_modules=['detection'])
+    # FaceAnalysis has a .det_model with internal session and params; use it directly for speed
+    det = fa.det_model
+    det.prepare(ctx_id=0, input_size=(in_w, in_h))
+    det.use_kps = False
+
+    # Precompute FPN anchor centers (copied from LiveCC FaceDetector)
+    import numpy as _np
+    fpn_centers = []
+    for stride in det._feat_stride_fpn:
+        ac = _np.stack(_np.mgrid[:in_h // stride, :in_w // stride][::-1], axis=-1).astype(_np.float32)
+        ac = (ac * stride).reshape((-1, 2))
+        ac = _np.stack([ac]*det._num_anchors, axis=1).reshape((-1, 2))
+        fpn_centers.append(torch.from_numpy(ac))
+    fpn_centers = torch.cat(fpn_centers)
+
+    # Decode frames via decord in manageable chunks
+    decord.bridge.set_bridge('torch')
+    rdr = decord.VideoReader(args.videoFilePath, width=in_w, height=in_h, num_threads=2)
+    n = len(rdr)
+    dets = []
+
+    # Detection helper on one frame tensor (C,H,W) uint8/float in [0..255]
+    def _detect_one(frame_chw: torch.Tensor):
+        # Normalize to NCHW float32 with mean/std matching SCRFD
+        fr = frame_chw.to(torch.float32)
+        fr = torch.stack([
+            (fr[0] - 127.5) / 128.0,
+            (fr[1] - 127.5) / 128.0,
+            (fr[2] - 127.5) / 128.0,
+        ], dim=0)
+        inp = fr.unsqueeze(0).numpy()  # NCHW float32
+        outs = det.session.run(det.output_names, {det.input_name: inp})
+        scores, distances = [], []
+        for i, stride in enumerate(det._feat_stride_fpn):
+            scores.append(outs[i])
+            distances.append(outs[i+det.fmc] * stride)
+        scores = torch.from_numpy(_np.vstack(scores)).flatten()
+        distances = torch.from_numpy(_np.vstack(distances))
+        keep = scores >= float(det.det_thresh)
+        if not torch.any(keep):
+            return None
+        scores = scores[keep]
+        distances = distances[keep]
+        boxes = torch.cat([fpn_centers[keep] - distances[:, :2], fpn_centers[keep] + distances[:, 2:]], dim=1)
+        # NMS
+        from torchvision.ops import nms as _nms
+        keep2 = _nms(boxes, scores, iou_threshold=float(det.nms_thresh))
+        boxes = boxes[keep2]
+        scores = scores[keep2]
+        if boxes.numel() == 0:
+            return None
+        # Scale back to original resolution
+        boxes = boxes.to(torch.float32)
+        boxes[:, [0,2]] = boxes[:, [0,2]] * scale_x
+        boxes[:, [1,3]] = boxes[:, [1,3]] * scale_y
+        bb = boxes.to(torch.int32).tolist()
+        sc = [float(s.item()) for s in scores]
+        out = []
+        for (x1,y1,x2,y2), s in zip(bb, sc):
+            out.append([x1,y1,x2,y2,s])
+        return out
+
+    CHUNK = 512
+    for start in range(0, n, CHUNK):
+        end = min(n, start + CHUNK)
+        idxs = list(range(start, end))
+        frames_bthwc = rdr.get_batch(idxs)  # (B,H,W,3) torch
+        frames_bchw = frames_bthwc.permute(0,3,1,2)  # (B,3,H,W)
+        for i in range(frames_bchw.shape[0]):
+            boxes = _detect_one(frames_bchw[i])
+            if boxes is None:
+                dets.append([])
+            else:
+                frame_dets = []
+                for b in boxes:
+                    frame_dets.append({'frame': start + i, 'bbox': [int(b[0]),int(b[1]),int(b[2]),int(b[3])], 'conf': float(b[4])})
+                dets.append(frame_dets)
+        if start % (CHUNK*2) == 0:
+            sys.stderr.write(f"{args.videoFilePath}-{start:05d}; chunk {start}-{end} processed\r")
 
     savePath = os.path.join(args.pyworkPath, 'faces.pckl')
     with open(savePath, 'wb') as fil:
@@ -451,6 +636,65 @@ def _probe_frame_pts(video_path: str):
     # Fallback to PyAV
     return _probe_frame_pts_with_pyav(video_path)
 
+def _sanitize_frame_times(frame_times_sec: list) -> list:
+    """Return a per-frame timestamp list of floats by filling missing entries.
+
+    - Accepts list possibly containing None for frames with unavailable PTS.
+    - Computes median positive delta from valid neighboring floats.
+    - Fills leading/trailing/isolated None by stepping with median_dt to keep a
+      non-decreasing sequence. Raises if insufficient valid data.
+    """
+    import numpy as _np
+    if not isinstance(frame_times_sec, list) or len(frame_times_sec) == 0:
+        raise RuntimeError("Empty frame_times_sec for PTS sanitization")
+    # Collect valid floats
+    vals = [float(x) for x in frame_times_sec if isinstance(x, (int, float))]
+    if len(vals) < max(2, len(frame_times_sec)//10):
+        raise RuntimeError("Insufficient valid PTS timestamps for sanitization")
+    # Estimate median dt from valid consecutive diffs
+    diffs = []
+    last = None
+    for x in frame_times_sec:
+        if isinstance(x, (int, float)):
+            xf = float(x)
+            if last is not None and xf > last:
+                diffs.append(xf - last)
+            last = xf
+    if not diffs:
+        raise RuntimeError("Cannot derive positive PTS delta for sanitization")
+    median_dt = float(_np.median(_np.asarray(diffs, dtype=float)))
+    # Forward pass: fill from left to right
+    out = [None] * len(frame_times_sec)
+    last_val = None
+    # First known index and value
+    first_idx = None
+    for i, v in enumerate(frame_times_sec):
+        if isinstance(v, (int, float)):
+            out[i] = float(v)
+            last_val = out[i]
+            if first_idx is None:
+                first_idx = i
+        else:
+            if last_val is not None:
+                last_val = last_val + median_dt
+                out[i] = last_val
+    # Backward pass: fill leading None using first known anchor
+    if first_idx is not None:
+        base = out[first_idx]
+        for i in range(first_idx-1, -1, -1):
+            base = base - median_dt
+            out[i] = max(0.0, base)
+    # Final check and monotonic clamp
+    prev = 0.0
+    for i in range(len(out)):
+        if not isinstance(out[i], float):
+            # In rare case no anchor found (shouldn't happen due to earlier checks)
+            raise RuntimeError("Failed to sanitize frame timestamps (residual None)")
+        if out[i] < prev:
+            out[i] = prev
+        prev = out[i]
+    return out
+
 def _resample_tracks_to_scores(annotated_tracks, scores):
     """Return a new list of tracks resampled so that len(frames)==len(scores[i]).
 
@@ -506,11 +750,18 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
     - Runs TalkNet with batched windows per track (same durations/averaging as file-based path).
     Returns: list of scores per track (same structure as evaluate_network).
     """
-    # 1) Prepare 25fps time grid and per-track start/end seconds via constant FPS timeline
-    if not hasattr(args, 'videoFps') or args.videoFps is None or float(args.videoFps) <= 0:
-        raise RuntimeError("Missing or invalid args.videoFps; cannot align in-memory ASD.")
-    FPS_SRC = float(args.videoFps)
-    median_dt = 1.0 / max(1.0, FPS_SRC)
+    # 1) Prepare 25fps time grid and per-track start/end seconds via PTS timeline
+    frame_times_sec = _probe_frame_pts(args.videoFilePath)
+    if not isinstance(frame_times_sec, list) or len(frame_times_sec) == 0:
+        raise RuntimeError("Invalid or empty PTS timestamps for ASD alignment")
+    frame_times_sec = _sanitize_frame_times(frame_times_sec)
+    # Median frame duration for tail fill
+    _fts = np.asarray(frame_times_sec, dtype=float)
+    diffs = np.diff(_fts)
+    diffs = diffs[diffs > 0]
+    if diffs.size == 0:
+        raise RuntimeError("Non-positive PTS deltas; cannot derive frame duration")
+    median_dt = float(np.median(diffs))
 
     # Build mapping: frame index -> list of (track_idx, local_idx)
     frame_to_entries = defaultdict(list)
@@ -532,9 +783,11 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
         track_ranges.append((s_f, e_f))
         if s_f < 0 or e_f < s_f:
             raise RuntimeError(f"Invalid track frame indices: {s_f}-{e_f}")
-        # Use CFR timeline derived from effective FPS for robust alignment
-        t_s = float(s_f) / FPS_SRC
-        t_e = float(e_f) / FPS_SRC
+        # Use PTS timeline derived from container for robust alignment
+        if s_f >= len(frame_times_sec) or e_f >= len(frame_times_sec):
+            raise RuntimeError("Track frame indices exceed timestamp map length")
+        t_s = float(frame_times_sec[s_f])
+        t_e = float(frame_times_sec[e_f])
         track_start_sec[tidx] = t_s
         track_end_sec[tidx] = t_e
         for lidx, f in enumerate(frames_list):
@@ -609,7 +862,7 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
                 rois_t = torch.tensor(rois, device=device, dtype=torch.float32)
                 crops = roi_align(img_t, rois_t, output_size=(224,224), spatial_scale=1.0, sampling_ratio=-1, aligned=True)
                 crops = (crops.clamp(0.0,1.0) * 255.0).to(torch.uint8).permute(0,2,3,1).contiguous().cpu().numpy()  # B,224,224,3
-                t_src = float(fidx) / FPS_SRC
+                t_src = float(frame_times_sec[fidx])
                 for j in range(crops.shape[0]):
                     tidx = tids[j]
                     # cache latest face
@@ -634,8 +887,8 @@ def evaluate_network_in_memory(tracks, args, frame_start: int = None, frame_end:
 
     # 3) TalkNet ASD with cross-track batching per duration
     s = talkNet(); s.loadParameters(args.pretrainModel); s.eval()
-    # Multi-GPU: simple DataParallel across all visible devices
-    use_dp = (torch.cuda.device_count() > 1)
+    # Multi-GPU: simple DataParallel across all visible devices (can be disabled via env in worker)
+    use_dp = (torch.cuda.device_count() > 1) and (os.environ.get('ASD_FORCE_DP', '1') != '0')
     dp_model = torch.nn.DataParallel(s) if use_dp else None
     durationU = [1,2,3,4,5,6]
     # load full audio once
@@ -831,6 +1084,7 @@ def stream_crop_tracks(args, tracks):
     track_end_sec = {}
     # Probe per-frame timestamps (prefer ffprobe; fallback to PyAV) before mapping frames to seconds
     frame_times_sec = _probe_frame_pts(args.videoFilePath)
+    frame_times_sec = _sanitize_frame_times(frame_times_sec)
     for tr in tracks:
         frames = tr['frame'] if isinstance(tr, dict) else tr['track']['frame']
         frames_list = frames.tolist() if hasattr(frames, 'tolist') else list(frames)
@@ -842,11 +1096,9 @@ def stream_crop_tracks(args, tracks):
             track_ranges.append((s_f, e_f))
             if s_f < 0 or e_f >= len(frame_times_sec):
                 raise RuntimeError(f"Track frames out of bounds for timestamp map: {s_f}-{e_f} vs {len(frame_times_sec)}")
-            t_s = frame_times_sec[s_f]; t_e = frame_times_sec[e_f]
-            if not (isinstance(t_s, float) and isinstance(t_e, float)):
-                raise RuntimeError("Invalid PTS timestamps for track start/end")
-            track_start_sec[len(track_ranges)-1] = float(t_s)
-            track_end_sec[len(track_ranges)-1] = float(t_e)
+            t_s = float(frame_times_sec[s_f]); t_e = float(frame_times_sec[e_f])
+            track_start_sec[len(track_ranges)-1] = t_s
+            track_end_sec[len(track_ranges)-1] = t_e
 
     # Compute median frame interval from PTS for end padding; fallback to 1/25 if diffs missing
     _pts_diffs = []
@@ -939,7 +1191,7 @@ def stream_crop_tracks(args, tracks):
             crops_b = crops_b.permute(0, 2, 3, 1).contiguous().cpu().numpy()  # B,224,224,C (BGR preserved)
 
             # Update writers and write frames according to 25fps grid
-            t_src = frame_times_sec[fidx]
+            t_src = float(frame_times_sec[fidx])
             for j in range(len(tids)):
                 tidx = tids[j]
                 lidx = lidxs[j]
@@ -1066,13 +1318,56 @@ def _mux_worker(t):
 def _asd_scene_worker(args_pack):
     """Top-level worker for in-memory ASD on a scene range.
 
-    Args: (idxs, tr_sub, s_f, e_f, minimal_dict)
-    Returns: (idxs, scores_sublist)
+    Args: (tasks_chunk, minimal_dict, gpu_id)
+      tasks_chunk: list of (idxs, tr_sub, s_f, e_f)
+    Returns: list of (idxs, scores_sublist)
     """
     from types import SimpleNamespace
-    idxs, tr_sub, s_f, e_f, minimal = args_pack
+    tasks_chunk, minimal, gpu_id = args_pack
+    # Bind this worker to a single device and disable DP inside
+    try:
+        if torch.cuda.is_available() and gpu_id is not None and int(gpu_id) >= 0:
+            torch.cuda.set_device(int(gpu_id))
+    except Exception:
+        pass
+    os.environ['ASD_FORCE_DP'] = '0'
     a = SimpleNamespace(**minimal)
-    return (idxs, evaluate_network_in_memory(tr_sub, a, frame_start=s_f, frame_end=e_f))
+    out = []
+    for (idxs, tr_sub, s_f, e_f) in tasks_chunk:
+        out.append((idxs, evaluate_network_in_memory(tr_sub, a, frame_start=s_f, frame_end=e_f)))
+    return out
+
+def _diar_chunk_worker(args_pack):
+    """Worker: run WhisperX diarization on an audio chunk and shift times.
+
+    Args: (s0, s1, audio_path, min_speakers, max_speakers, hf_token, gpu_id)
+    Returns: list[dict{start,end,speaker}]
+    """
+    s0, s1, audio_path, min_k, max_k, tok, gpu_id = args_pack
+    try:
+        if torch.cuda.is_available() and int(gpu_id) >= 0:
+            torch.cuda.set_device(int(gpu_id))
+    except Exception:
+        pass
+    pipe = whisperx.DiarizationPipeline(use_auth_token=tok, device='cuda' if torch.cuda.is_available() else 'cpu')
+    # Load audio and slice locally to avoid large IPC payloads
+    audio_full = whisperx.load_audio(audio_path)
+    sr_local = 16000.0
+    a0 = int(round(float(s0) * sr_local)); a1 = int(round(float(s1) * sr_local))
+    a0 = max(0, a0); a1 = max(a0 + 1, a1)
+    wav_chunk = audio_full[a0:a1]
+    if min_k is not None or max_k is not None:
+        segs = pipe(wav_chunk, min_speakers=min_k, max_speakers=max_k)
+    else:
+        segs = pipe(wav_chunk)
+    df = _to_diarize_df(segs)
+    rows = []
+    for _, r in df.iterrows():
+        st = float(r['start']) + float(s0)
+        en = float(r['end']) + float(s0)
+        if en > st:
+            rows.append({'start': st, 'end': en, 'speaker': str(r.get('speaker', 'SPEAKER_XX'))})
+    return rows
 
 def evaluate_network(files, args):
     # GPU: active speaker detection by pretrained TalkNet (batched windows)
@@ -1080,8 +1375,8 @@ def evaluate_network(files, args):
     s.loadParameters(args.pretrainModel)
     sys.stderr.write("Model %s loaded from previous state! \r\n"%args.pretrainModel)
     s.eval()
-    # Multi-GPU: simple DataParallel across all visible devices
-    use_dp = (torch.cuda.device_count() > 1)
+    # Multi-GPU: simple DataParallel across all visible devices (can be disabled via env in worker)
+    use_dp = (torch.cuda.device_count() > 1) and (os.environ.get('ASD_FORCE_DP', '1') != '0')
     dp_model = torch.nn.DataParallel(s) if use_dp else None
     allScores = []
     # durationSet = {1,2,4,6}
@@ -1612,17 +1907,84 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
             pass
         print(result.get("segments", []))
     else:
-        # WhisperX internal loader (faster-whisper / ct2)
-        # faster-whisper/ctranslate2 expects device like 'cuda' and a separate device_index
+        # Faster-whisper direct multi-GPU with concurrency across fixed 30s windows
         try:
-            model = whisperx.load_model(model_name, device, compute_type=compute_type, device_index=(dev_idx if dev_idx >= 0 else 0))
-        except TypeError:
-            # For older whisperx that doesn't take device_index kw, fall back to device only
-            model = whisperx.load_model(model_name, device, compute_type=compute_type)
+            from faster_whisper import WhisperModel as FWWhisperModel
+        except Exception as e:
+            raise RuntimeError("faster-whisper is required but not available in this environment") from e
+
+        n_vis = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        dev = "cuda" if n_vis > 0 else "cpu"
+        dev_index = list(range(n_vis)) if n_vis > 0 else 0
+        num_workers = max(1, n_vis)
+
+        fw_model = FWWhisperModel(
+            model_name,
+            device=dev,
+            device_index=dev_index,
+            compute_type=compute_type,
+            num_workers=num_workers,
+        )
         audio = whisperx.load_audio(audio_file)
-        result = model.transcribe(audio, batch_size=batch_size)
-        print(result.get("segments", []))  # before alignment
-        # 2. Align whisper output
+        sr = 16000
+        # Language detection on first 30s (info only)
+        try:
+            cut = int(min(len(audio), sr * 30))
+            lang, lang_prob = fw_model.detect_language(audio[:cut])
+            print(f"Detected language: {lang} ({lang_prob:.2f}) in first 30s of audio...")
+        except Exception:
+            lang = None
+
+        # Fixed 30s windows; concurrency across GPUs
+        total_sec = float(len(audio)) / float(sr)
+        chunk_len = 30.0
+        bounds = []
+        t = 0.0
+        while t < total_sec - 1e-6:
+            t2 = min(total_sec, t + chunk_len)
+            bounds.append((t, t2))
+            t = t2
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        max_workers = max(1, n_vis)
+
+        def _transcribe_window(s_sec: float, e_sec: float):
+            a0 = int(round(s_sec * sr)); a1 = int(round(e_sec * sr))
+            wav = audio[a0:a1]
+            segs, info = fw_model.transcribe(
+                wav,
+                language=(lang if isinstance(lang, str) else None),
+                beam_size=5,
+                patience=1,
+                length_penalty=1.0,
+                without_timestamps=False,
+                vad_filter=False,
+                word_timestamps=False,
+            )
+            out = []
+            for seg in segs:
+                out.append({
+                    "start": s_sec + float(seg.start),
+                    "end":   s_sec + float(seg.end),
+                    "text":  getattr(seg, 'text', ''),
+                })
+            # prefer detected language from info if available
+            return out, getattr(info, 'language', None)
+
+        merged_segments = []
+        lang_final = lang
+        if bounds:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futs = [ex.submit(_transcribe_window, s, e) for (s, e) in bounds]
+                for fut in as_completed(futs):
+                    out, l = fut.result()
+                    if isinstance(l, str) and not lang_final:
+                        lang_final = l
+                    merged_segments.extend(out)
+        merged_segments.sort(key=lambda d: (float(d.get('start', 0.0)), float(d.get('end', 0.0))))
+
+        result = {"segments": merged_segments, "language": (lang_final or "en")}
+        # 2) Align via WhisperX for word timing
         model_a, metadata = whisperx.load_align_model(language_code=result["language"], device=device)
         result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=False)
 
@@ -1640,25 +2002,107 @@ def speech_diarization(min_speakers: int = None, max_speakers: int = None):
     os.environ.setdefault('HUGGINGFACE_HUB_TOKEN', hf_token)
 
     try:
-        diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
-        try:
-            if min_speakers is not None or max_speakers is not None:
-                diarize_segments = diarize_model(
-                    audio,
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers,
-                )
+        # Parallel diarization by window if requested
+        W = max(1, int(getattr(args, 'diarWorkers', 1)))
+        if W > 1:
+            import torch.multiprocessing as mp
+            sr = 16000.0
+            total_sec = float(len(audio)) / sr if isinstance(audio, (list, np.ndarray)) and len(audio) > 0 else 0.0
+            if total_sec <= 0.0:
+                # Probe duration via ffprobe as fallback
+                try:
+                    out_d = subprocess.check_output([
+                        'ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1', audio_file
+                    ], stderr=subprocess.STDOUT).decode('utf-8').strip()
+                    total_sec = float(out_d)
+                except Exception:
+                    total_sec = 0.0
+            if total_sec <= 0.0:
+                raise RuntimeError('Unable to determine audio duration for diarization')
+            win = float(getattr(args, 'diarWindowSec', 60.0))
+            ov = float(getattr(args, 'diarOverlapSec', 3.0))
+            # Pre-warm pipeline once to ensure models cached (avoid multi-proc downloads)
+            try:
+                tlog_local = _StageTimer(os.path.join(args.pyworkPath, 'time_log.jsonl'), meta={'pid': int(os.getpid()), 'video_name': str(args.videoName)})
+            except Exception:
+                tlog_local = None
+            if tlog_local:
+                with tlog_local.timer('diar_prepare'):
+                    _ = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
+                    del _
             else:
-                diarize_segments = diarize_model(audio)
-        except Exception:
-            if min_speakers is not None or max_speakers is not None:
-                diarize_segments = diarize_model(
-                    audio_file,
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers,
-                )
+                _ = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
+                del _
+
+            # Build windows
+            chunks = []
+            t = 0.0
+            while t < total_sec - 1e-6:
+                t2 = min(total_sec, t + win)
+                chunks.append((t, t2))
+                if t2 >= total_sec:
+                    break
+                t = t + win - ov
+            if not chunks:
+                raise RuntimeError('No diarization chunks built')
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            packs = []
+            for i, (s0, s1) in enumerate(chunks):
+                packs.append((s0, s1, audio_file, min_speakers, max_speakers, hf_token, (i % n_gpus) if n_gpus > 0 else -1))
+            ctx = mp.get_context('spawn')
+            # Map with timing
+            if tlog_local:
+                with tlog_local.timer('diar_chunk_map', extra={'chunks': int(len(packs)), 'workers': int(min(W, len(packs)))}):
+                    with ctx.Pool(processes=min(W, len(packs))) as pool:
+                        out_rows = pool.map(_diar_chunk_worker, packs)
             else:
-                diarize_segments = diarize_model(audio_file)
+                with ctx.Pool(processes=min(W, len(packs))) as pool:
+                    out_rows = pool.map(_diar_chunk_worker, packs)
+            # Merge with timing
+            if tlog_local:
+                with tlog_local.timer('diar_merge'):
+                    merged = [x for rows in out_rows for x in rows]
+                    merged.sort(key=lambda d: (d['start'], d['end']))
+                    # Drop exact duplicates within small tolerance
+                    tol = 0.1
+                    diarize_segments = []
+                    for d in merged:
+                        if diarize_segments:
+                            p = diarize_segments[-1]
+                            if abs(p['start'] - d['start']) <= tol and abs(p['end'] - d['end']) <= tol and str(p.get('speaker')) == str(d.get('speaker')):
+                                continue
+                        diarize_segments.append(d)
+            else:
+                merged = [x for rows in out_rows for x in rows]
+                merged.sort(key=lambda d: (d['start'], d['end']))
+                tol = 0.1
+                diarize_segments = []
+                for d in merged:
+                    if diarize_segments:
+                        p = diarize_segments[-1]
+                        if abs(p['start'] - d['start']) <= tol and abs(p['end'] - d['end']) <= tol and str(p.get('speaker')) == str(d.get('speaker')):
+                            continue
+                    diarize_segments.append(d)
+        else:
+            diarize_model = whisperx.DiarizationPipeline(use_auth_token=hf_token, device=device)
+            try:
+                if min_speakers is not None or max_speakers is not None:
+                    diarize_segments = diarize_model(
+                        audio,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                    )
+                else:
+                    diarize_segments = diarize_model(audio)
+            except Exception:
+                if min_speakers is not None or max_speakers is not None:
+                    diarize_segments = diarize_model(
+                        audio_file,
+                        min_speakers=min_speakers,
+                        max_speakers=max_speakers,
+                    )
+                else:
+                    diarize_segments = diarize_model(audio_file)
     except AttributeError:
         # Fallback for older WhisperX versions
         from pyannote.audio import Pipeline
@@ -2917,6 +3361,389 @@ def _wrap_for_panel(text: str, text_w_px: int, font_size_px: float, max_lines: i
             lines[-1] += '…'
     return lines
 
+def _render_panel_chunk_worker(args_pack):
+    """Worker: render panel frames [start_idx, end_idx) to a chunk mp4.
+
+    args_pack = (
+        start_idx, end_idx, panel_w, panel_h, fps_eff,
+        font_path, msgs, id_colors, mem_idents,
+        avatars_cache_path, max_items, chunk_out,
+    )
+    """
+    import os, math, pickle, subprocess
+    import numpy as _np
+    try:
+        import skia  # type: ignore
+    except Exception as e:
+        raise RuntimeError('skia-python is required for panel rendering (worker)') from e
+
+    (start_idx, end_idx, panel_w, panel_h, fps_eff,
+     font_path, msgs, id_colors, mem_idents,
+     avatars_cache_path, max_items, chunk_out) = args_pack
+
+    typeface = skia.Typeface.MakeFromFile(font_path)
+    if typeface is None:
+        raise RuntimeError(f'Failed to load typeface from {font_path}')
+    font_title = skia.Font(typeface, 20)
+    font_text = skia.Font(typeface, 18)
+
+    # Load avatars cache
+    with open(avatars_cache_path, 'rb') as f:
+        avatars = pickle.load(f)
+
+    # Colors and layout
+    title_color = skia.ColorSetARGB(255, 230, 230, 235)
+    text_color = skia.ColorSetARGB(255, 220, 220, 220)
+    time_color = skia.ColorSetARGB(255, 170, 170, 180)
+    card_bg = skia.ColorSetARGB(180, 28, 28, 32)
+    card_active = skia.ColorSetARGB(210, 40, 40, 50)
+    border_color = skia.ColorSetARGB(200, 70, 70, 80)
+    glow_color = skia.ColorSetARGB(160, 50, 120, 255)
+    bg_grad_c1 = skia.ColorSetARGB(255, 16, 16, 20)
+    bg_grad_c2 = skia.ColorSetARGB(255, 6, 6, 8)
+
+    pad = 16
+    card_gap = 10
+    avatar_r = 26
+    avatar_d = avatar_r * 2
+    ring_th = 3
+    text_gap = 10
+
+    info = skia.ImageInfo.Make(panel_w, panel_h, skia.ColorType.kRGBA_8888_ColorType, skia.AlphaType.kUnpremul_AlphaType)
+    buf = _np.empty((panel_h, panel_w, 4), dtype=_np.uint8)
+
+    # ffmpeg pipe for chunk encoding (keep params identical across chunks)
+    cmd = [
+        'ffmpeg','-y','-f','rawvideo','-pix_fmt','rgb24',
+        '-s', f'{panel_w}x{panel_h}','-r', f'{fps_eff}',
+        '-i','-','-an','-c:v','libx264','-pix_fmt','yuv420p',
+        '-preset','veryfast','-crf','20', chunk_out,
+        '-loglevel','error'
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def ease_out_cubic(x: float) -> float:
+        x = max(0.0, min(1.0, x))
+        return 1.0 - (1.0 - x) ** 3
+
+    def draw_frame(canvas: 'skia.Canvas', t: float):
+        # Background gradient
+        shader = skia.GradientShader.MakeLinear(
+            [skia.Point(0, 0), skia.Point(0, panel_h)],
+            [bg_grad_c1, bg_grad_c2],
+            [0.0, 1.0],
+            skia.TileMode.kClamp
+        )
+        p_bg = skia.Paint(AntiAlias=True)
+        p_bg.setShader(shader)
+        canvas.drawRect(skia.Rect.MakeWH(panel_w, panel_h), p_bg)
+
+        # Memory bank (top area)
+        mem_pad = 12
+        avatar_sz = 42
+        cols = max(1, min(6, panel_w // (avatar_sz + mem_pad)))
+        rows = (len(mem_idents) + cols - 1) // cols if mem_idents else 0
+        mem_h = 0
+        p_title = skia.Paint(AntiAlias=True, Color=title_color)
+        if rows > 0:
+            title_h = int(font_title.getSize() * 1.2)
+            grid_h = rows * avatar_sz + (rows - 1) * mem_pad
+            mem_h = mem_pad + title_h + 6 + grid_h + mem_pad
+            canvas.drawString('Memory', mem_pad, mem_pad + font_title.getSize(), font_title, p_title)
+            start_y = mem_pad + title_h + 6
+            for idx, ident in enumerate(mem_idents):
+                r = idx // cols
+                c = idx % cols
+                cx = int(mem_pad + c * (avatar_sz + mem_pad) + avatar_sz / 2)
+                cy = int(start_y + r * (avatar_sz + mem_pad) + avatar_sz / 2)
+                # ring
+                ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style)
+                rgb = id_colors.get(ident, (200, 200, 200))
+                ring.setColor(skia.ColorSetRGB(*rgb))
+                ring.setStrokeWidth(3)
+                canvas.drawCircle(cx, cy, avatar_sz / 2 + 2, ring)
+                # avatar
+                ava = avatars.get(ident)
+                if isinstance(ava, _np.ndarray) and ava.size > 0:
+                    h0, w0 = ava.shape[:2]
+                    arr_rgba = _np.concatenate([ava, _np.full((h0, w0, 1), 255, dtype=_np.uint8)], axis=-1)
+                    sk_img = skia.Image.fromarray(arr_rgba)
+                    if sk_img is not None:
+                        canvas.save()
+                        path = skia.Path(); path.addCircle(cx, cy, avatar_sz/2)
+                        canvas.clipPath(path, doAntiAlias=True)
+                        dst = skia.Rect.MakeXYWH(cx - avatar_sz/2, cy - avatar_sz/2, avatar_sz, avatar_sz)
+                        canvas.drawImageRect(sk_img, dst, skia.SamplingOptions(skia.FilterMode.kLinear))
+                        canvas.restore()
+
+        # visible messages up to t
+        vis = [m for m in msgs if m['start'] <= t]
+        if not vis:
+            return
+        vis = vis[-max_items:]
+
+        # Layout metrics
+        line_h = int(font_text.getSize() * 1.3)
+        title_h = int(font_title.getSize() * 1.2)
+        card_pad_v = 12
+        card_pad_h = 12
+        heights = []
+        for m in vis:
+            text_h = title_h + (len(m['lines']) * line_h)
+            h = max(avatar_d, text_h) + card_pad_v*2
+            heights.append(h)
+        total_h = sum(heights) + card_gap * (len(heights) - 1)
+        y_top = mem_h + pad
+        chat_rect = skia.Rect.MakeLTRB(0, y_top, panel_w, panel_h - pad)
+        y_base = panel_h - pad - total_h
+        if y_base < y_top:
+            y_base = y_top
+        # Slide-up animation for newest
+        slide_dur = 0.25
+        s = 0.0
+        if len(vis) >= 1:
+            newest = vis[-1]
+            h_new = heights[-1]
+            p = ease_out_cubic((t - float(newest['start'])) / slide_dur) if t >= float(newest['start']) else 0.0
+            slack = max(0.0, (panel_h - pad) - (y_base + total_h))
+            want = float(h_new + (card_gap if len(vis) > 1 else 0))
+            s = (1.0 - p) * min(want, slack)
+        canvas.save()
+        canvas.clipRect(chat_rect, doAntiAlias=True)
+        y = y_base - s
+
+        p_fill = skia.Paint(AntiAlias=True)
+        p_stroke = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style)
+        p_text = skia.Paint(AntiAlias=True, Color=text_color)
+        p_title2 = skia.Paint(AntiAlias=True, Color=title_color)
+
+        for i, m in enumerate(vis):
+            h = heights[i]
+            appear = ease_out_cubic((t - float(m['start'])) / 0.18)
+            x_offset = int((1.0 - appear) * 30)
+            alpha_scale = appear
+            active = (m['start'] <= t <= m['end'])
+            bg_col = card_active if active else card_bg
+            rect = skia.Rect.MakeXYWH(pad + x_offset, y, panel_w - pad*2, h)
+            rrect = skia.RRect.MakeRectXY(rect, 14, 14)
+            # Shadow
+            shadow = skia.Paint(AntiAlias=True)
+            shadow.setColor(skia.ColorSetARGB(int(70*alpha_scale), 0, 0, 0))
+            try:
+                drop = skia.ImageFilters.DropShadow(0, 3, 10, 10, skia.ColorSetARGB(int(140*alpha_scale), 0, 0, 0))
+                shadow.setImageFilter(drop)
+            except Exception:
+                pass
+            canvas.drawRRect(rrect, shadow)
+            # Fill
+            p_fill.setColor(bg_col)
+            p_fill.setAlphaf(float(alpha_scale))
+            canvas.drawRRect(rrect, p_fill)
+            # Border
+            p_stroke.setColor(border_color)
+            p_stroke.setStrokeWidth(1.5)
+            p_stroke.setAlphaf(0.8 * float(alpha_scale))
+            canvas.drawRRect(rrect, p_stroke)
+            # Glow
+            if active:
+                pulse = 0.5 + 0.5 * math.sin((t - m['start']) * 6.28 * 0.8)
+                gpaint = skia.Paint(AntiAlias=True)
+                gpaint.setColor(glow_color)
+                gpaint.setAlphaf(0.25 + 0.35 * pulse)
+                canvas.drawRRect(skia.RRect.MakeRectXY(skia.Rect.MakeXYWH(rect.left(), rect.top(), 6, rect.height()), 3, 3), gpaint)
+            # Avatar ring
+            cx = rect.left() + card_pad_h + avatar_r
+            cy = rect.top() + card_pad_v + avatar_r
+            rgb = id_colors.get(m['identity'], (200, 200, 200))
+            ring = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style)
+            ring.setColor(skia.ColorSetRGB(*rgb))
+            ring.setStrokeWidth(ring_th)
+            ring.setAlphaf(float(alpha_scale))
+            canvas.drawCircle(cx, cy, avatar_r + ring_th*0.5, ring)
+            # Avatar image
+            ava_img = avatars.get(m['identity'])
+            if isinstance(ava_img, _np.ndarray) and ava_img.size > 0:
+                h0, w0 = ava_img.shape[:2]
+                arr_rgba = _np.concatenate([ava_img, _np.full((h0, w0, 1), 255, dtype=_np.uint8)], axis=-1)
+                sk_img = skia.Image.fromarray(arr_rgba)
+                if sk_img is not None:
+                    canvas.save()
+                    path = skia.Path(); path.addCircle(cx, cy, avatar_r)
+                    canvas.clipPath(path, doAntiAlias=True)
+                    dst = skia.Rect.MakeXYWH(cx - avatar_r, cy - avatar_r, avatar_d, avatar_d)
+                    canvas.drawImageRect(sk_img, dst, skia.SamplingOptions(skia.FilterMode.kLinear))
+                    canvas.restore()
+            # Title
+            ts_min = int(m['start'] // 60)
+            ts_sec = int(m['start'] % 60)
+            title = f"{m['identity']}  {ts_min:02d}:{ts_sec:02d}"
+            tx = rect.left() + card_pad_h + avatar_d + text_gap
+            ty = rect.top() + card_pad_v + font_title.getSize()
+            p_title2.setAlphaf(float(alpha_scale))
+            canvas.drawString(title, tx, ty, font_title, p_title2)
+            # Text lines
+            p_text.setAlphaf(float(alpha_scale))
+            for li, line in enumerate(m['lines']):
+                ly = ty + 6 + (li + 1) * line_h
+                canvas.drawString(line, tx, ly, font_text, p_text)
+            y += h + card_gap
+        canvas.restore()
+
+    try:
+        for i in range(int(start_idx), int(end_idx)):
+            t = i / float(fps_eff)
+            surface = skia.Surface(panel_w, panel_h)
+            canvas = surface.getCanvas()
+            draw_frame(canvas, t)
+            row_bytes = int(buf.strides[0])
+            ok = surface.readPixels(info, buf, row_bytes)
+            if not ok:
+                raise RuntimeError('Failed to read Skia surface pixels')
+            frame_rgb = buf[:, :, :3]
+            proc.stdin.write(frame_rgb.tobytes())
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait()
+    return chunk_out
+
+def _render_side_panel_skia_parallel(base_video_path: str,
+                                     diarization_results: list,
+                                     tracks: list,
+                                     output_panel_path: str,
+                                     width_ratio: float,
+                                     theme: str,
+                                     max_items: int,
+                                     W: int, H: int, fps_eff: float, dur: float):
+    import os, math, subprocess, pickle
+    import torch.multiprocessing as mp
+    # Dimensions
+    panel_w = max(64, int(round(float(W) * float(width_ratio))))
+    panel_h = int(H)
+    total_frames = int(math.floor(dur * fps_eff)) if dur and dur > 0 else None
+    if total_frames is None:
+        raise RuntimeError('Cannot determine total frames for panel rendering')
+
+    # Fonts
+    fonts_dir_abs, _ = _ensure_chinese_font()
+    font_path = os.path.join(fonts_dir_abs, 'NotoSansCJKsc-Regular.otf')
+    if not os.path.isfile(font_path):
+        cands = [f for f in os.listdir(fonts_dir_abs) if f.lower().endswith(('.otf', '.ttf'))]
+        if not cands:
+            raise RuntimeError('No suitable font file found for Skia panel')
+        font_path = os.path.join(fonts_dir_abs, cands[0])
+
+    # Colors and memory identities
+    id_colors = _id_color_map_global(tracks)
+    mem_idents = []
+    seen = set()
+    for tr in tracks:
+        ident = _normalize_identity_prefix(tr.get('identity'))
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        if ident in seen:
+            continue
+        seen.add(ident)
+        mem_idents.append(ident)
+    mem_idents.sort()
+
+    # Avatars cache (strict)
+    avatars_cache_path = os.path.join(args.pyworkPath, 'identity_avatars_magface.pckl')
+    if not os.path.isfile(avatars_cache_path):
+        raise RuntimeError(f"Missing identity avatars cache: {avatars_cache_path}. Run clustering to generate avatars.")
+    import pickle as _pickle
+    try:
+        with open(avatars_cache_path, 'rb') as _f:
+            _avatars_map = _pickle.load(_f)
+    except Exception as _e:
+        raise RuntimeError(f"Failed to load avatars cache: {avatars_cache_path}") from _e
+    missing = [ident for ident in set(mem_idents) if ident not in _avatars_map]
+    if missing:
+        raise RuntimeError(f"Avatars missing for identities: {missing}. Re-run clustering to regenerate avatars cache.")
+
+    # Messages (pre-wrap lines)
+    pad = 16
+    avatar_r = 26
+    avatar_d = avatar_r * 2
+    text_gap = 10
+    text_w = panel_w - pad*2 - avatar_d - text_gap
+    msgs = []
+    for seg in (diarization_results or []):
+        ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        s = float(seg.get('start', seg.get('start_time', 0.0)))
+        e = float(seg.get('end', seg.get('end_time', s)))
+        if e <= s:
+            continue
+        txt = str(seg.get('text', '')).strip()
+        msgs.append({'identity': ident, 'start': s, 'end': e, 'text': txt})
+    msgs.sort(key=lambda m: (m['start'], m['end']))
+    # font_text size is 18 in worker; use same numeric size here for wrapping
+    for m in msgs:
+        m['lines'] = _wrap_for_panel(m['text'], text_w, 18, max_lines=4)
+
+    # Split into chunks
+    n_workers = max(1, int(getattr(args, 'panelWorkers', 1)))
+    n_workers = min(n_workers, total_frames) if total_frames > 0 else 1
+    chunk = (total_frames + n_workers - 1) // n_workers
+    ranges = []
+    for w in range(n_workers):
+        s = w * chunk
+        e = min(total_frames, (w + 1) * chunk)
+        if e > s:
+            ranges.append((s, e))
+    if not ranges:
+        raise RuntimeError('No frame ranges computed for panel rendering')
+
+    # Prepare chunk outputs
+    out_dir = os.path.dirname(os.path.abspath(output_panel_path))
+    os.makedirs(out_dir, exist_ok=True)
+    packs = []
+    chunk_paths = []
+    for idx, (s, e) in enumerate(ranges):
+        chunk_out = f"{output_panel_path}.part{idx:03d}.mp4"
+        try:
+            os.remove(chunk_out)
+        except Exception:
+            pass
+        pack = (s, e, panel_w, panel_h, fps_eff, font_path, msgs, id_colors, mem_idents, avatars_cache_path, max_items, chunk_out)
+        packs.append(pack)
+        chunk_paths.append(chunk_out)
+
+    # Run workers (spawn)
+    ctx = mp.get_context('spawn')
+    with ctx.Pool(processes=len(packs)) as pool:
+        res = pool.map(_render_panel_chunk_worker, packs)
+    # Verify
+    for p in chunk_paths:
+        if (p not in res) or (not os.path.isfile(p)) or (os.path.getsize(p) <= 0):
+            raise RuntimeError(f'Panel chunk missing or empty: {p}')
+
+    # Concat chunks
+    list_file = f"{output_panel_path}.concat.txt"
+    with open(list_file, 'w') as f:
+        for p in chunk_paths:
+            f.write(f"file '{os.path.abspath(p)}'\n")
+    cmd_concat = [
+        'ffmpeg','-y','-f','concat','-safe','0','-i', list_file,
+        '-c','copy', output_panel_path,
+        '-loglevel','error'
+    ]
+    rc = subprocess.call(cmd_concat)
+    if rc != 0:
+        raise RuntimeError('Failed to concatenate panel chunks')
+    # Cleanup
+    try:
+        os.remove(list_file)
+        for p in chunk_paths:
+            os.remove(p)
+    except Exception:
+        pass
+    return output_panel_path
+
 def render_side_panel_skia(base_video_path: str,
                            diarization_results: list,
                            tracks: list,
@@ -2936,6 +3763,23 @@ def render_side_panel_skia(base_video_path: str,
 
     # Probe base video
     W, H, fps_eff, dur = _ffprobe_video_props(base_video_path)
+    # Parallel path: split frames across workers and concat
+    try:
+        n_workers = int(getattr(args, 'panelWorkers', 1))
+    except Exception:
+        n_workers = 1
+    if n_workers and n_workers > 1:
+        _render_side_panel_skia_parallel(
+            base_video_path,
+            diarization_results,
+            tracks,
+            output_panel_path,
+            width_ratio,
+            theme,
+            max_items,
+            W, H, fps_eff, dur,
+        )
+        return
     panel_w = max(64, int(round(float(W) * float(width_ratio))))
     panel_h = H
     total_frames = int(math.floor(dur * fps_eff)) if dur > 0 else None
@@ -3874,77 +4718,27 @@ def process_video():
     os.makedirs(args.pyworkPath, exist_ok = True) # Save the results in this process by the pckl method
     os.makedirs(args.pycropPath, exist_ok = True) # Save the detected face clips (audio+video) in this process
 
-    # Extract video
-    # Re-encode input to constant 25fps for robust, consistent timeline
-    args.videoFilePath = os.path.join(args.pyaviPath, 'video.mp4')
+    # Timing logger
+    time_log_path = os.path.join(args.pyworkPath, 'time_log.jsonl')
+    tlog = _StageTimer(time_log_path, meta={'pid': int(os.getpid()), 'video_name': str(args.videoName)})
 
-    # (moved _ensure_cfr25 and _ffmpeg_dual_worker to module scope for pickling)
-
-    need_encode = True
-    if os.path.exists(args.videoFilePath):
-        # Check if already 25fps
-        try:
-            out = subprocess.check_output([
-                'ffprobe','-v','error','-select_streams','v:0',
-                '-show_entries','stream=r_frame_rate,avg_frame_rate',
-                '-of','default=noprint_wrappers=1:nokey=1',
-                args.videoFilePath
-            ], stderr=subprocess.STDOUT).decode('utf-8').strip().splitlines()
-            def _parse_frac(s: str) -> float:
-                try:
-                    if '/' in s:
-                        a,b = s.split('/')
-                        return float(a)/float(b) if float(b) != 0 else 0.0
-                    return float(s)
-                except Exception:
-                    return 0.0
-            r_fps = _parse_frac(out[0].strip()) if len(out) >= 1 else 0.0
-            avg_fps = _parse_frac(out[1].strip()) if len(out) >= 2 else 0.0
-            eff = r_fps or avg_fps
-            need_encode = abs(eff - 25.0) > 0.01
-        except Exception:
-            need_encode = True
-    # Run CFR re-encode and audio extraction in parallel (no quality change)
-    force_rebuild = need_encode
+    # Extract video/audio — skip CFR re-encode; operate on original container with PTS
+    args.videoFilePath = args.videoPath
+    force_rebuild = False
     args.audioFilePath = os.path.join(args.pyaviPath, 'audio.wav')
-    tasks = []
-    if need_encode:
-        print("Re-encoding input to 25fps CFR...")
-        tasks.append(('cfr', (args.videoPath,
-                              args.videoFilePath,
-                              float(args.start),
-                              float(args.duration) if args.duration else 0.0,
-                              int(args.nDataLoaderThread))))
-    else:
-        sys.stderr.write("25fps CFR video already exists, skipping re-encode: %s \r\n" % args.videoFilePath)
-
-    if os.path.exists(args.audioFilePath):
-        sys.stderr.write("Audio already exists, skipping extraction: %s \r\n" % args.audioFilePath)
-    else:
-        print("Extracting audio in parallel...")
-        # Extract audio (trim if start/duration specified) directly from ORIGINAL input
-        tasks.append(('aud', (args.videoPath,
-                              args.audioFilePath,
-                              float(args.start),
-                              float(args.duration) if args.duration else 0.0,
-                              int(args.nDataLoaderThread))))
-
-    if tasks:
-        import torch.multiprocessing as mp
-        ctx = mp.get_context('spawn')
-        with ctx.Pool(processes=len(tasks)) as pool:
-            res = pool.map(_ffmpeg_dual_worker, tasks)
-        # Validate results
-        for kind, rc in res:
-            if rc != 0:
-                if kind == 'cfr':
-                    raise RuntimeError("Failed to re-encode input to 25fps for processing")
-                elif kind == 'aud':
-                    raise RuntimeError("Failed to extract audio to 16k PCM WAV")
-        if need_encode:
-            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Re-encoded the video to 25fps CFR at %s \r\n" %(args.videoFilePath))
-        if not os.path.exists(args.audioFilePath):
-            raise RuntimeError("Audio extraction reported success but output file missing")
+    with tlog.timer('audio_extract'):
+        if os.path.exists(args.audioFilePath):
+            sys.stderr.write("Audio already exists, skipping extraction: %s \r\n" % args.audioFilePath)
+        else:
+            ss_to = ''
+            if args.duration and float(args.duration) > 0:
+                ss_to = f" -ss {float(args.start):.3f} -to {float(args.start)+float(args.duration):.3f}"
+            cmd = (
+                f"ffmpeg -y -i {args.videoPath}{ss_to} -c:a pcm_s16le -ac 1 -vn -threads {int(args.nDataLoaderThread)} -ar 16000 {args.audioFilePath} -loglevel panic"
+            )
+            subprocess.call(cmd, shell=True, stdout=None)
+            if not os.path.exists(args.audioFilePath):
+                raise RuntimeError("Audio extraction failed: output file missing")
 
     # Derive an effective FPS without relying on extracted frames
     def _compute_effective_fps_from_container(audio_wav_path: str, video_path: str) -> float:
@@ -4015,73 +4809,77 @@ def process_video():
         raise RuntimeError("Unable to derive FPS from container metadata or audio duration")
 
     args.videoFps = _compute_effective_fps_from_container(args.audioFilePath, args.videoFilePath)
-    # Force to exactly 25 for downstream alignment since we re-encoded to CFR 25
-    args.videoFps = 25.0
-    sys.stderr.write(f"Using effective FPS for timeline alignment: {args.videoFps:.6f}\n")
+    sys.stderr.write(f"Using effective FPS from container: {args.videoFps:.6f}\n")
 
     # Scene detection for the video frames
     scene_path = os.path.join(args.pyworkPath, 'scene.pckl')
     if (not os.path.exists(scene_path)) or force_rebuild:
-        scene = scene_detect(args)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scene detection and save in %s \r\n" %(args.pyworkPath))    
+        with tlog.timer('scene_detect'):
+            scene = scene_detect(args)
+            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scene detection and save in %s \r\n" %(args.pyworkPath))    
     else:
-        sys.stderr.write("Loading existing scene detection from %s \r\n" % scene_path)
-        with open(scene_path, 'rb') as fil:
-            scene = pickle.load(fil)
+        with tlog.timer('scene_load'):
+            sys.stderr.write("Loading existing scene detection from %s \r\n" % scene_path)
+            with open(scene_path, 'rb') as fil:
+                scene = pickle.load(fil)
 
     # Face detection for the video frames
     faces_path = os.path.join(args.pyworkPath, 'faces.pckl')
     if (not os.path.exists(faces_path)) or force_rebuild:
-        faces = inference_video(args)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(args.pyworkPath))
+        with tlog.timer('face_detect'):
+            faces = inference_video(args)
+            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(args.pyworkPath))
     else:
-        sys.stderr.write("Loading existing face detection from %s \r\n" % faces_path)
-        with open(faces_path, 'rb') as fil:
-            faces = pickle.load(fil)
+        with tlog.timer('face_load'):
+            sys.stderr.write("Loading existing face detection from %s \r\n" % faces_path)
+            with open(faces_path, 'rb') as fil:
+                faces = pickle.load(fil)
 
     # Face tracking
     tracks_path = os.path.join(args.pyworkPath, 'tracks.pckl')
     if (not os.path.exists(tracks_path)) or force_rebuild:
-        allTracks, vidTracks = [], []
-        for shot in scene:
-            if shot[1].frame_num - shot[0].frame_num >= args.minTrack:
-                allTracks.extend(track_shot(args, faces[shot[0].frame_num:shot[1].frame_num]))
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face track and detected %d tracks \r\n" % len(allTracks))
+        with tlog.timer('track_build'):
+            allTracks, vidTracks = [], []
+            for shot in scene:
+                if shot[1].frame_num - shot[0].frame_num >= args.minTrack:
+                    allTracks.extend(track_shot(args, faces[shot[0].frame_num:shot[1].frame_num]))
+            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face track and detected %d tracks \r\n" % len(allTracks))
 
-        # Build in-memory tracks and also write pycrop clips for robust ASD
-        base_tracks = []
-        for t in allTracks:
-            tr_norm = {'frame': t['frame'], 'bbox': t['bbox']}
-            base_tracks.append(tr_norm)
-        # Always build in-memory tracks; do not write pycrop clips
-        for tr_norm in base_tracks:
-            vidTracks.append({
-                'track': tr_norm,
-                'proc_track': build_proc_track(tr_norm, args.cropScale),
-                'video_path': args.videoFilePath,
-                'cropScale': float(args.cropScale),
-            })
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Tracks prepared (in-memory only).\r\n")
-        with open(tracks_path, 'wb') as fil:
-            pickle.dump(vidTracks, fil)
+            # Build in-memory tracks and also write pycrop clips for robust ASD
+            base_tracks = []
+            for t in allTracks:
+                tr_norm = {'frame': t['frame'], 'bbox': t['bbox']}
+                base_tracks.append(tr_norm)
+            # Always build in-memory tracks; do not write pycrop clips
+            for tr_norm in base_tracks:
+                vidTracks.append({
+                    'track': tr_norm,
+                    'proc_track': build_proc_track(tr_norm, args.cropScale),
+                    'video_path': args.videoFilePath,
+                    'cropScale': float(args.cropScale),
+                })
+            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Tracks prepared (in-memory only).\r\n")
+            with open(tracks_path, 'wb') as fil:
+                pickle.dump(vidTracks, fil)
 
-        # Build scene frame ranges for parallel ASD (used if in-memory ASD is needed)
-        scene_ranges = []  # list of (start_frame, end_frame)
-        for shot in scene:
-            s_f = int(shot[0].frame_num)
-            e_f = int(shot[1].frame_num) - 1
-            if e_f >= s_f:
-                scene_ranges.append((s_f, e_f))
+            # Build scene frame ranges for parallel ASD (used if in-memory ASD is needed)
+            scene_ranges = []  # list of (start_frame, end_frame)
+            for shot in scene:
+                s_f = int(shot[0].frame_num)
+                e_f = int(shot[1].frame_num) - 1
+                if e_f >= s_f:
+                    scene_ranges.append((s_f, e_f))
     else:
-        sys.stderr.write("Loading existing face tracks from %s \r\n" % tracks_path)
-        with open(tracks_path, 'rb') as fil:
-            vidTracks = pickle.load(fil)
-        # Ensure in-memory identity clustering has needed context
-        for tr in vidTracks:
-            if isinstance(tr, dict):
-                tr['video_path'] = args.videoFilePath
-                tr['cropScale'] = float(args.cropScale)
-        # Do not generate pycrop clips in the reload path either (always in-memory)
+        with tlog.timer('track_load'):
+            sys.stderr.write("Loading existing face tracks from %s \r\n" % tracks_path)
+            with open(tracks_path, 'rb') as fil:
+                vidTracks = pickle.load(fil)
+            # Ensure in-memory identity clustering has needed context
+            for tr in vidTracks:
+                if isinstance(tr, dict):
+                    tr['video_path'] = args.videoFilePath
+                    tr['cropScale'] = float(args.cropScale)
+            # Do not generate pycrop clips in the reload path either (always in-memory)
 
     # Active Speaker Detection by TalkNet — always compute in-memory (no pycrop clips)
     scores_path = os.path.join(args.pyworkPath, 'scores.pckl')
@@ -4109,24 +4907,32 @@ def process_video():
                 idxs.append(i); tr_sub.append(tr)
         if tr_sub:
             scene_tasks.append((idxs, tr_sub, s_f, e_f))
-    # Run workers
+    # Run workers (multi-GPU: split scenes across processes, one GPU per worker)
     import torch.multiprocessing as mp
-    minimal = dict(videoFilePath=args.videoFilePath, pyaviPath=args.pyaviPath, pretrainModel=args.pretrainModel, cropScale=args.cropScale, asdBatch=int(getattr(args,'asdBatch',64)), videoFps=float(args.videoFps))
+    minimal = dict(videoFilePath=args.videoFilePath, pyaviPath=args.pyaviPath, pretrainModel=args.pretrainModel, cropScale=args.cropScale, asdBatch=int(getattr(args,'asdBatch',64)))
     results = []
-    if scene_tasks:
-        # When multiple GPUs are available, defer parallelism to DataParallel inside
-        # evaluate_network_in_memory to avoid oversubscribing the same GPUs across processes.
-        multi_gpu = (torch.cuda.device_count() > 1)
-        eff_workers = 1 if multi_gpu else int(getattr(args,'sceneWorkers',6))
-        if eff_workers > 1:
-            ctx = mp.get_context('spawn')
-            with ctx.Pool(processes=eff_workers) as pool:
-                for idxs, sc_scores in pool.map(_asd_scene_worker, [(idxs, tr_sub, s_f, e_f, minimal) for (idxs,tr_sub,s_f,e_f) in scene_tasks]):
-                    results.append((idxs, sc_scores))
-        else:
-            from types import SimpleNamespace
-            for (idxs, tr_sub, s_f, e_f) in scene_tasks:
-                results.append((idxs, evaluate_network_in_memory(tr_sub, SimpleNamespace(**minimal), frame_start=s_f, frame_end=e_f)))
+    with tlog.timer('asd_compute'):
+        if scene_tasks:
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            workers = max(1, min(len(scene_tasks), n_gpus if n_gpus > 0 else 1))
+            if workers > 1:
+                # Round-robin assign tasks to workers with fixed gpu_id per worker
+                chunks = [[] for _ in range(workers)]
+                for idx, task in enumerate(scene_tasks):
+                    chunks[idx % workers].append(task)
+                args_list = [(chunks[i], minimal, i if n_gpus > 0 else -1) for i in range(workers)]
+                ctx = mp.get_context('spawn')
+                with ctx.Pool(processes=workers) as pool:
+                    mapped = pool.map(_asd_scene_worker, args_list)
+                # Flatten
+                for lst in mapped:
+                    for pair in lst:
+                        results.append(pair)
+            else:
+                from types import SimpleNamespace
+                # Single process path
+                for (idxs, tr_sub, s_f, e_f) in scene_tasks:
+                    results.append((idxs, evaluate_network_in_memory(tr_sub, SimpleNamespace(**minimal), frame_start=s_f, frame_end=e_f)))
     # Merge scores back in order; initialize empty lists
     scores = [None] * len(base_tracks)
     for idxs, sc_scores in results:
@@ -4142,9 +4948,10 @@ def process_video():
     # Identity assignment via episode-level visual clustering (stable VID_* labels)
     identity_tracks_path = os.path.join(args.pyworkPath, 'tracks_identity.pckl')
     if os.path.exists(identity_tracks_path):
-        sys.stderr.write("Loading existing identity tracks from %s \r\n" % identity_tracks_path)
-        with open(identity_tracks_path, 'rb') as fil:
-            annotated_tracks = pickle.load(fil)
+        with tlog.timer('identity_load'):
+            sys.stderr.write("Loading existing identity tracks from %s \r\n" % identity_tracks_path)
+            with open(identity_tracks_path, 'rb') as fil:
+                annotated_tracks = pickle.load(fil)
         # Normalize legacy VID_* -> Person_* for display consistency
         changed = False
         for tr in annotated_tracks:
@@ -4159,18 +4966,19 @@ def process_video():
             except Exception:
                 pass
     else:
-        sys.stderr.write("Clustering visual identities with constraints (in-memory embeddings if needed)...\r\n")
-        # Pass ASD scores to enable active-frame gating inside clustering/embedding
-        annotated_tracks = cluster_visual_identities(
-            vidTracks,
-            scores_list=scores if 'scores' in locals() else None,
-            batch_size=int(getattr(args, 'idBatch', 64)),
-            face_sim_thresh=0.50,
-            save_avatars_path=os.path.join(args.pyworkPath, 'identity_avatars_magface.pckl'),
-        )
-        with open(identity_tracks_path, 'wb') as fil:
-            pickle.dump(annotated_tracks, fil)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Tracks with clustered identities saved in %s \r\n" % args.pyworkPath)
+        with tlog.timer('identity_cluster'):
+            sys.stderr.write("Clustering visual identities with constraints (in-memory embeddings if needed)...\r\n")
+            # Pass ASD scores to enable active-frame gating inside clustering/embedding
+            annotated_tracks = cluster_visual_identities(
+                vidTracks,
+                scores_list=scores if 'scores' in locals() else None,
+                batch_size=int(getattr(args, 'idBatch', 64)),
+                face_sim_thresh=0.50,
+                save_avatars_path=os.path.join(args.pyworkPath, 'identity_avatars_magface.pckl'),
+            )
+            with open(identity_tracks_path, 'wb') as fil:
+                pickle.dump(annotated_tracks, fil)
+            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Tracks with clustered identities saved in %s \r\n" % args.pyworkPath)
 
     # Ensure ASD scores align with current tracks; if not, recompute scores in-memory
     if not isinstance(scores, list) or len(scores) != len(annotated_tracks):
@@ -4183,38 +4991,41 @@ def process_video():
             pickle.dump(scores, fil)
         sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Scores re-extracted (in-memory) and saved in %s \r\n" %args.pyworkPath)
 
-    # If frame lengths mismatch scores lengths (due to 25fps resampling), build resampled tracks for diarization
+    # If frame lengths mismatch scores lengths (due to 25fps resampling), we used to resample tracks.
+    # Current diarization mapping uses original annotated_tracks with absolute frame indices and
+    # robustly aligns via min(len(frames), len(scores)), so resampling is no longer needed and
+    # only adds heavy compute on long videos. Skip it to avoid stalls.
     mism = [i for i in range(min(len(annotated_tracks), len(scores))) if len(scores[i]) != (len(annotated_tracks[i]['track']['frame']) if 'track' in annotated_tracks[i] and 'frame' in annotated_tracks[i]['track'] else 0)]
     if mism:
-        sys.stderr.write(f"Resampling tracks to 25fps grid for diarization (mismatch count={len(mism)})\n")
-        annotated_tracks_25 = _resample_tracks_to_scores(annotated_tracks, scores)
-    else:
-        annotated_tracks_25 = annotated_tracks
+        sys.stderr.write(f"Skipping resample-to-25fps for diarization (mismatch count={len(mism)})\n")
 
     # Run WhisperX diarization without constraining K (use only for words + timings)
     raw_diarization_path = os.path.join(args.pyworkPath, 'raw_diriazation.pckl')
     if os.path.exists(raw_diarization_path):
-        sys.stderr.write("Loading existing raw diarization from %s \r\n" % raw_diarization_path)
-        with open(raw_diarization_path, 'rb') as fil:
-            raw_segments = pickle.load(fil)
-        raw_results = {"segments": raw_segments}
+        with tlog.timer('diarization_load'):
+            sys.stderr.write("Loading existing raw diarization from %s \r\n" % raw_diarization_path)
+            with open(raw_diarization_path, 'rb') as fil:
+                raw_segments = pickle.load(fil)
+            raw_results = {"segments": raw_segments}
     else:
-        raw_results = speech_diarization()
-        with open(raw_diarization_path, 'wb') as fil:
-            pickle.dump(raw_results["segments"], fil)
-        sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Raw diarization extracted and saved in %s \r\n" %args.pyworkPath)
+        with tlog.timer('diarization_compute'):
+            raw_results = speech_diarization()
+            with open(raw_diarization_path, 'wb') as fil:
+                pickle.dump(raw_results["segments"], fil)
+            sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Raw diarization extracted and saved in %s \r\n" %args.pyworkPath)
 
     # Per-segment framewise argmax mapping with minimal run-length smoothing
     matched_diarization_path = os.path.join(args.pyworkPath, 'matched_diriazation.pckl')
     # Important: use original annotated_tracks with absolute frame indices for mapping.
     # Resampled tracks (0..T-1) lose absolute timing and break alignment with diarization.
-    diar_for_subs = split_segments_by_positive_fill(
-        annotated_tracks,
-        scores,
-        raw_results["segments"],
-        fps=25.0,
-        min_run_frames=6,
-    )
+    with tlog.timer('diarization_match'):
+        diar_for_subs = split_segments_by_positive_fill(
+            annotated_tracks,
+            scores,
+            raw_results["segments"],
+            fps=25.0,
+            min_run_frames=6,
+        )
     if not diar_for_subs:
         raise RuntimeError("Framewise argmax mapping produced no segments; aborting to avoid empty subtitles.")
     # Persist for inspection
@@ -4225,7 +5036,8 @@ def process_video():
     # Visualization, save the result as the new video    
     # Build word list for word-timed subtitles
     flat_words = _flatten_aligned_words(raw_results["segments"]) if isinstance(raw_results, dict) and 'segments' in raw_results else _flatten_aligned_words(raw_results)
-    visualization(annotated_tracks, scores, diar_for_subs, args, words_list=flat_words)
+    with tlog.timer('visualization'):
+        visualization(annotated_tracks, scores, diar_for_subs, args, words_list=flat_words)
 
     # Optional: Skia side panel with chat-like messages (compose onto subtitles video)
     if bool(getattr(args, 'renderPanel', False)):
@@ -4235,15 +5047,16 @@ def process_video():
             raise RuntimeError(f"Base video for panel composition not found: {base_in}")
         panel_out = os.path.join(args.pyaviPath, 'video_panel.mp4')
         sys.stderr.write(f"Rendering Skia side panel to {panel_out}...\n")
-        render_side_panel_skia(
-            base_in,
-            diar_for_subs,
-            annotated_tracks,
-            panel_out,
-            width_ratio=float(getattr(args, 'panelWidthRatio', 0.28)),
-            theme=str(getattr(args, 'panelTheme', 'glass')).lower(),
-            max_items=int(getattr(args, 'panelMaxItems', 6)),
-        )
+        with tlog.timer('panel_render'):
+            render_side_panel_skia(
+                base_in,
+                diar_for_subs,
+                annotated_tracks,
+                panel_out,
+                width_ratio=float(getattr(args, 'panelWidthRatio', 0.28)),
+                theme=str(getattr(args, 'panelTheme', 'glass')).lower(),
+                max_items=int(getattr(args, 'panelMaxItems', 6)),
+            )
         # Compose side-by-side (hstack), keep audio from base
         combined = os.path.join(args.pyaviPath, 'video_with_panel.mp4')
         cmd_combine = (
@@ -4251,7 +5064,8 @@ def process_video():
             f"-map \"[v]\" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -threads {int(args.nDataLoaderThread)} "
             f"-c:a aac -b:a 192k -ar 16000 {combined} -loglevel error"
         )
-        rc = subprocess.call(cmd_combine, shell=True)
+        with tlog.timer('panel_compose'):
+            rc = subprocess.call(cmd_combine, shell=True)
         if rc != 0:
             raise RuntimeError("Failed to compose base video with side panel via ffmpeg hstack")
         sys.stderr.write(f"Composed video saved: {combined}\n")
