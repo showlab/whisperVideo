@@ -182,6 +182,9 @@ class MagFaceEmbedder:
             raise RuntimeError('Unexpected MagFace checkpoint format: missing state_dict')
         state_dict = self._clean_state_dict(net, state['state_dict'])
         net.load_state_dict(state_dict, strict=True)
+        # Force MagFace backbone to use float32 weights to avoid dtype
+        # mismatches under external mixed-precision/autocast environments.
+        net = net.to(dtype=torch.float32)
         self.model = net.eval().to(self.device)
         # Enable multi-GPU inference for MagFace backbone when available
         if self.device.type == 'cuda' and torch.cuda.device_count() > 1:
@@ -380,8 +383,12 @@ class MagFaceEmbedder:
         mags = []
         # batch forward
         for i in range(0, len(tensors), self.batch_size):
-            batch = torch.stack(tensors[i : i + self.batch_size], dim=0).to(self.device)
-            out = self.model(batch)  # (B, 512), BN applied
+            batch = torch.stack(tensors[i : i + self.batch_size], dim=0).to(
+                self.device, dtype=torch.float32
+            )
+            # Disable external autocast to keep conv input/weights both float32
+            with torch.autocast(device_type='cuda', enabled=False):
+                out = self.model(batch)  # (B, 512), BN applied
             # Use raw BN output as feature; compute magnitude
             mag = torch.norm(out, p=2, dim=1)  # (B,)
             # Normalize features for cosine usage
@@ -422,8 +429,11 @@ class MagFaceEmbedder:
         feats = []
         mags = []
         for j in range(0, len(tensors), self.batch_size):
-            batch = torch.stack(tensors[j : j + self.batch_size], dim=0).to(self.device)
-            out = self.model(batch)
+            batch = torch.stack(tensors[j : j + self.batch_size], dim=0).to(
+                self.device, dtype=torch.float32
+            )
+            with torch.autocast(device_type='cuda', enabled=False):
+                out = self.model(batch)
             mag = torch.norm(out, p=2, dim=1)
             out_n = F.normalize(out, p=2, dim=1)
             feats.append(out_n)
@@ -474,8 +484,11 @@ class MagFaceEmbedder:
         feats = []
         mags = []
         for i in range(0, len(tensors), self.batch_size):
-            batch = torch.stack(tensors[i : i + self.batch_size], dim=0).to(self.device)
-            out = self.model(batch)  # (B, 512)
+            batch = torch.stack(tensors[i : i + self.batch_size], dim=0).to(
+                self.device, dtype=torch.float32
+            )
+            with torch.autocast(device_type='cuda', enabled=False):
+                out = self.model(batch)  # (B, 512)
             mag = torch.norm(out, p=2, dim=1)  # (B,)
             out_n = F.normalize(out, p=2, dim=1)
             feats.append(out_n)

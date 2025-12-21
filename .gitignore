@@ -57,10 +57,14 @@ model/faceDetector/s3fd/sfd_face.pth
 checkpoints/
 runs/
 outputs/
+output/
 
 # ---- Data & Generated ----
 data/
 TalkSet/lists/lists_out/
+
+# ---- Local backups ----
+inference_folder_sam3_backup_*.py
 
 # ---- Media (often large) ----
 *.mp4

@@ -25,8 +25,6 @@ from scenedetect.scene_manager import SceneManager
 from scenedetect.frame_timecode import FrameTimecode
 from scenedetect.stats_manager import StatsManager
 from scenedetect.detectors import ContentDetector
-
-from model.faceDetector.s3fd import S3FD
 from talkNet import talkNet
 from identity_verifier import IdentityVerifier
 try:
@@ -44,6 +42,11 @@ try:
         _cv_quiet.utils.logging.setLogLevel(_cv_quiet.utils.logging.LOG_LEVEL_SILENT)
 except Exception:
     pass
+
+# Central place to choose ffmpeg binary. Allows user to override from env to
+# ensure the Python process uses the same ffmpeg that was tested in the shell.
+# Default to system ffmpeg (/usr/bin/ffmpeg), which we verified has libx264.
+_FFMPEG_BIN = os.environ.get('WHISPERV_FFMPEG_BIN', '/usr/bin/ffmpeg')
 try:
     import av as _av_quiet  # type: ignore
     if hasattr(_av_quiet, 'logging'):
@@ -52,15 +55,13 @@ except Exception:
     pass
 
 def _ensure_cfr25(input_path: str, output_path: str, start: float = 0.0, duration: float = 0.0, threads: int = 4):
-    """Top-level helper to re-encode input to 25fps CFR H.264 MP4.
-    Maintains exact quality settings used elsewhere (libx264, CRF=18, veryfast).
-    """
+    """Top-level helper to re-encode input to 25fps CFR MP4 using libx264."""
     ss_to = ''
     if duration and duration > 0:
         ss_to = f" -ss {start:.3f} -to {start+duration:.3f}"
     cmd = (
-        f"ffmpeg -y -i {input_path}{ss_to} -r 25 -vsync cfr -pix_fmt yuv420p "
-        f"-c:v libx264 -preset veryfast -crf 18 -c:a aac -b:a 192k -threads {int(threads)} {output_path} -loglevel panic"
+        f"{_FFMPEG_BIN} -y -i {input_path}{ss_to} -r 25 -vsync cfr -pix_fmt yuv420p "
+        f"-c:v libx264 -crf 18 -c:a aac -b:a 192k -threads {int(threads)} {output_path} -loglevel panic"
     )
     return subprocess.call(cmd, shell=True, stdout=None)
 
@@ -83,7 +84,7 @@ def _ffmpeg_dual_worker(task):
             if du and float(du) > 0:
                 ss_to = f" -ss {float(st):.3f} -to {float(st)+float(du):.3f}"
             cmd = (
-                f"ffmpeg -y -i {in_p}{ss_to} -c:a pcm_s16le -ac 1 -vn -threads {int(th)} -ar 16000 {out_wav} -loglevel panic"
+                f"{_FFMPEG_BIN} -y -i {in_p}{ss_to} -c:a pcm_s16le -ac 1 -vn -threads {int(th)} -ar 16000 {out_wav} -loglevel panic"
             )
             rc = subprocess.call(cmd, shell=True, stdout=None)
             return ('aud', rc)
@@ -107,10 +108,10 @@ parser.add_argument('--cropScale',             type=float, default=0.40, help='S
 
 parser.add_argument('--start',                 type=int, default=0,   help='The start time of the video')
 parser.add_argument('--duration',              type=int, default=0,  help='The duration of the video, when set as 0, will extract the whole video')
-parser.add_argument('--facedetBatch',         type=int,   default=-1,  help='Batch size for S3FD face detection (-1 = auto max)')
-parser.add_argument('--detBackend',           type=str,   default='scrfd', choices=['s3fd','scrfd'], help='Face detector backend: s3fd (PyTorch) or scrfd (InsightFace ONNX)')
-parser.add_argument('--detInputW',            type=int,   default=288, help='Detector input width for SCRFD (resized decode via decord)')
-parser.add_argument('--detInputH',            type=int,   default=160, help='Detector input height for SCRFD (resized decode via decord)')
+parser.add_argument('--facedetBatch',         type=int,   default=-1,  help='(Unused in SAM3-only pipeline)')
+parser.add_argument('--detBackend',           type=str,   default='sam3', choices=['sam3'], help='Face detector backend (SAM3 only in this script)')
+parser.add_argument('--detInputW',            type=int,   default=288, help='(Unused in SAM3-only pipeline)')
+parser.add_argument('--detInputH',            type=int,   default=160, help='(Unused in SAM3-only pipeline)')
 parser.add_argument('--idBatch',              type=int,   default=-1,   help='Batch size for identity embedding (-1 = auto max)')
 parser.add_argument('--asdBatch',             type=int,   default=-1,   help='Batch size for ASD window inference (-1 = auto max)')
 parser.add_argument('--cropWorkers',          type=int,   default=8,    help='Parallel workers for audio cut + mux per track')
@@ -130,6 +131,11 @@ parser.add_argument('--subtitle',            action='store_true', default=False,
 parser.add_argument('--diarWorkers',         type=int,   default=1,    help='Parallel workers for diarization (GPU, torch.multiprocessing)')
 parser.add_argument('--diarWindowSec',       type=float, default=60.0, help='Diarization window length in seconds')
 parser.add_argument('--diarOverlapSec',      type=float, default=3.0,  help='Diarization window overlap in seconds')
+
+# SAM3 parallel processing options
+parser.add_argument('--sam3Parallel',        action='store_true', default=True, help='Enable parallel SAM3 processing with temporal chunking (default on)')
+parser.add_argument('--sam3ChunkSec',        type=float, default=30.0, help='SAM3 chunk duration in seconds (default 30s)')
+parser.add_argument('--sam3OverlapSec',      type=float, default=3.0,  help='SAM3 chunk overlap in seconds for track continuity (default 3s)')
 
 args, unknown  = parser.parse_known_args()
 
@@ -269,6 +275,513 @@ def _ensure_chinese_font():
     # Internal name for this font
     return os.path.abspath(fonts_dir), 'Noto Sans CJK SC'
 
+# ============================================================================
+# TEMPORAL CHUNKING PARALLEL SAM3 PROCESSING
+# ============================================================================
+
+def _get_video_info(video_path):
+    """Get video duration, fps, and frame count using ffprobe."""
+    import subprocess
+    import json as _json
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=duration,r_frame_rate,nb_frames',
+            '-show_entries', 'format=duration',
+            '-of', 'json',
+            video_path
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode('utf-8')
+        data = _json.loads(out)
+
+        # Get duration (prefer format duration, fallback to stream)
+        duration = 0.0
+        if 'format' in data and 'duration' in data['format']:
+            duration = float(data['format']['duration'])
+        elif 'streams' in data and len(data['streams']) > 0:
+            if 'duration' in data['streams'][0]:
+                duration = float(data['streams'][0]['duration'])
+
+        # Get fps
+        fps = 25.0
+        if 'streams' in data and len(data['streams']) > 0:
+            r_rate = data['streams'][0].get('r_frame_rate', '25/1')
+            if '/' in r_rate:
+                num, den = r_rate.split('/')
+                fps = float(num) / float(den) if float(den) != 0 else 25.0
+            else:
+                fps = float(r_rate)
+
+        # Get frame count
+        nb_frames = 0
+        if 'streams' in data and len(data['streams']) > 0:
+            nb_frames = int(data['streams'][0].get('nb_frames', 0))
+        if nb_frames == 0 and duration > 0:
+            nb_frames = int(duration * fps)
+
+        return duration, fps, nb_frames
+    except Exception:
+        # Fallback to OpenCV
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        nb_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = nb_frames / fps if fps > 0 else 0.0
+        cap.release()
+        return duration, fps, nb_frames
+
+
+def _segment_video_for_parallel(video_path, output_dir, chunk_duration_sec=120.0, overlap_sec=5.0, fps=25.0, threads=4):
+    """
+    Segment video into temporal chunks for parallel processing.
+
+    Args:
+        video_path: Input video path
+        output_dir: Directory to store chunk files
+        chunk_duration_sec: Duration of each chunk in seconds
+        overlap_sec: Overlap between consecutive chunks in seconds
+        fps: Video FPS
+        threads: FFmpeg threads
+
+    Returns:
+        List of tuples: [(chunk_path, start_frame, end_frame, chunk_idx), ...]
+    """
+    duration, vid_fps, total_frames = _get_video_info(video_path)
+    if duration <= 0:
+        raise RuntimeError(f"Cannot determine video duration: {video_path}")
+
+    fps = vid_fps if vid_fps > 0 else fps
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    chunks = []
+    chunk_idx = 0
+    start_sec = 0.0
+
+    while start_sec < duration:
+        end_sec = min(start_sec + chunk_duration_sec, duration)
+        chunk_path = os.path.join(output_dir, f"chunk_{chunk_idx:04d}.mp4")
+
+        # Calculate frame indices for this chunk
+        start_frame = int(start_sec * fps)
+        end_frame = int(end_sec * fps)
+
+        # FFmpeg segment extraction (copy codec for speed, re-encode only if needed)
+        cmd = (
+            f"{_FFMPEG_BIN} -y -ss {start_sec:.3f} -i {video_path} "
+            f"-t {end_sec - start_sec:.3f} -c:v libx264 -crf 18 -preset ultrafast "
+            f"-c:a aac -threads {threads} {chunk_path} -loglevel error"
+        )
+        rc = subprocess.call(cmd, shell=True)
+        if rc != 0 or not os.path.exists(chunk_path):
+            raise RuntimeError(f"Failed to create chunk {chunk_idx} at {chunk_path}")
+
+        chunks.append((chunk_path, start_frame, end_frame, chunk_idx))
+
+        # Move to next chunk with overlap
+        start_sec = end_sec - overlap_sec
+        if start_sec >= duration - overlap_sec:
+            break
+        chunk_idx += 1
+
+    return chunks
+
+
+def _sam3_chunk_worker(task):
+    """
+    Worker function to process a single video chunk with SAM3.
+    Must be defined at top level for multiprocessing.
+
+    Args:
+        task: tuple (chunk_path, start_frame, end_frame, chunk_idx, gpu_id, sam3_root)
+
+    Returns:
+        dict with chunk_idx, frame_outputs (frame_idx -> detections), H, W
+    """
+    chunk_path, start_frame, end_frame, chunk_idx, gpu_id, sam3_root = task
+
+    import os
+    import sys
+    import numpy as np
+    import cv2
+    import torch
+
+    # Add SAM3 to path
+    if sam3_root not in sys.path:
+        sys.path.insert(0, sam3_root)
+
+    try:
+        from sam3.model_builder import build_sam3_video_predictor
+    except Exception as e:
+        import traceback
+        return {'error': f'Failed to import SAM3: {e}\n{traceback.format_exc()}', 'chunk_idx': chunk_idx}
+
+    try:
+        # Build predictor on the specific GPU (pass real GPU ID directly)
+        predictor = build_sam3_video_predictor(
+            gpus_to_use=[gpu_id],  # Use the real GPU ID directly
+            async_loading_frames=True,
+            video_loader_type="pyav",
+            compile=False,
+            image_size=1008,
+            recondition_every_nth_frame=64,
+        )
+
+        # Start session for this chunk
+        resp = predictor.handle_request({
+            "type": "start_session",
+            "resource_path": chunk_path,
+        })
+        session_id = resp["session_id"]
+
+        # Add face prompt
+        predictor.handle_request({
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "text": "face",
+        })
+
+        # Propagate and collect outputs
+        frame_outputs = {}
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for res in predictor.handle_stream_request({
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": "forward",
+                "start_frame_index": 0,
+                "max_frame_num_to_track": None,
+            }):
+                fidx = int(res.get("frame_index", -1))
+                out = res.get("outputs", None)
+                if out is not None and fidx >= 0:
+                    # Convert to numpy for pickling
+                    frame_outputs[fidx] = {
+                        'out_obj_ids': np.asarray(out.get('out_obj_ids', [])),
+                        'out_probs': np.asarray(out.get('out_probs', [])),
+                        'out_boxes_xywh': np.asarray(out.get('out_boxes_xywh', [])),
+                        'out_binary_masks': np.asarray(out.get('out_binary_masks', [])),
+                    }
+
+        # Close session
+        predictor.handle_request({"type": "close_session", "session_id": session_id})
+        try:
+            predictor.shutdown()
+        except Exception:
+            pass
+
+        # Get resolution
+        H, W = None, None
+        for out in frame_outputs.values():
+            masks = out.get('out_binary_masks', None)
+            if masks is not None and masks.ndim == 3 and masks.shape[0] > 0:
+                H, W = int(masks.shape[1]), int(masks.shape[2])
+                break
+        if H is None:
+            cap = cv2.VideoCapture(chunk_path)
+            if cap.isOpened():
+                ret, fr = cap.read()
+                if ret and fr is not None:
+                    H, W = fr.shape[0], fr.shape[1]
+            cap.release()
+
+        return {
+            'chunk_idx': chunk_idx,
+            'start_frame': start_frame,
+            'end_frame': end_frame,
+            'frame_outputs': frame_outputs,
+            'H': H,
+            'W': W,
+            'error': None,
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            'chunk_idx': chunk_idx,
+            'error': f'SAM3 processing failed: {e}\n{traceback.format_exc()}',
+        }
+    finally:
+        # Clean up GPU memory
+        torch.cuda.empty_cache()
+
+
+def _merge_chunk_results(chunk_results, overlap_frames, total_frames, H, W, iou_thresh=0.5):
+    """
+    Merge results from multiple chunks, handling overlapping regions.
+
+    Args:
+        chunk_results: List of chunk result dicts (sorted by chunk_idx)
+        overlap_frames: Number of overlapping frames between chunks
+        total_frames: Total number of frames in original video
+        H, W: Video resolution
+        iou_thresh: IOU threshold for matching objects in overlap region
+
+    Returns:
+        faces: List of detections per frame
+        sam3_masks_all: List of masks per frame
+    """
+    faces = [[] for _ in range(total_frames)]
+    sam3_masks_all = [[] for _ in range(total_frames)]
+
+    # Global object ID counter for remapping
+    global_obj_id_counter = 0
+    # Mapping from (chunk_idx, local_obj_id) -> global_obj_id
+    obj_id_mapping = {}
+
+    # Sort chunks by chunk_idx
+    sorted_results = sorted(chunk_results, key=lambda x: x['chunk_idx'])
+
+    for result in sorted_results:
+        if result.get('error'):
+            sys.stderr.write(f"Warning: chunk {result['chunk_idx']} failed: {result['error']}\n")
+            continue
+
+        chunk_idx = result['chunk_idx']
+        start_frame = result['start_frame']
+        frame_outputs = result.get('frame_outputs', {})
+
+        for local_fidx, out in frame_outputs.items():
+            global_fidx = start_frame + local_fidx
+            if global_fidx >= total_frames:
+                continue
+
+            obj_ids = out.get('out_obj_ids', np.array([]))
+            probs = out.get('out_probs', np.array([]))
+            boxes_xywh = out.get('out_boxes_xywh', np.array([]))
+            masks = out.get('out_binary_masks', np.array([]))
+
+            if len(obj_ids) == 0:
+                continue
+
+            # Convert boxes to pixel XYXY
+            if boxes_xywh.ndim == 2 and boxes_xywh.shape[1] == 4:
+                xs = boxes_xywh[:, 0] * float(W)
+                ys = boxes_xywh[:, 1] * float(H)
+                ws = boxes_xywh[:, 2] * float(W)
+                hs = boxes_xywh[:, 3] * float(H)
+                boxes_xyxy = np.stack([xs, ys, xs + ws, ys + hs], axis=-1)
+            else:
+                continue
+
+            for idx in range(len(obj_ids)):
+                local_obj_id = int(obj_ids[idx])
+                score = float(probs[idx])
+                bbox = boxes_xyxy[idx]
+
+                # Get or assign global object ID
+                key = (chunk_idx, local_obj_id)
+                if key not in obj_id_mapping:
+                    # Check if this object matches one from previous chunk in overlap region
+                    matched_global_id = None
+                    if chunk_idx > 0 and local_fidx < overlap_frames:
+                        # Look for matching object in previous chunk's overlap region
+                        prev_chunk_idx = chunk_idx - 1
+                        for (prev_cidx, prev_local_id), prev_global_id in obj_id_mapping.items():
+                            if prev_cidx == prev_chunk_idx:
+                                # Check IOU with existing detections at this frame
+                                for existing_det in faces[global_fidx]:
+                                    if existing_det.get('global_obj_id') == prev_global_id:
+                                        iou = _compute_iou(bbox, existing_det['bbox'])
+                                        if iou > iou_thresh:
+                                            matched_global_id = prev_global_id
+                                            break
+                            if matched_global_id:
+                                break
+
+                    if matched_global_id is not None:
+                        obj_id_mapping[key] = matched_global_id
+                    else:
+                        obj_id_mapping[key] = global_obj_id_counter
+                        global_obj_id_counter += 1
+
+                global_obj_id = obj_id_mapping[key]
+
+                # Check if we already have this object at this frame (from overlap)
+                already_exists = False
+                for existing_det in faces[global_fidx]:
+                    if existing_det.get('global_obj_id') == global_obj_id:
+                        already_exists = True
+                        break
+
+                if already_exists:
+                    continue  # Skip duplicate from overlap
+
+                # Convert bbox to int
+                bb = [int(round(v)) for v in bbox.tolist()]
+                x1_i, y1_i, x2_i, y2_i = bb
+                x1_i = max(0, min(x1_i, W - 1))
+                y1_i = max(0, min(y1_i, H - 1))
+                x2_i = max(0, min(x2_i, W))
+                y2_i = max(0, min(y2_i, H))
+
+                if x2_i <= x1_i or y2_i <= y1_i:
+                    continue
+
+                faces[global_fidx].append({
+                    "frame": global_fidx,
+                    "bbox": [x1_i, y1_i, x2_i, y2_i],
+                    "conf": score,
+                    "global_obj_id": global_obj_id,
+                })
+
+                if masks.ndim == 3 and idx < masks.shape[0]:
+                    mask_arr = masks[idx]
+                    if mask_arr.shape == (H, W) and mask_arr.any():
+                        sam3_masks_all[global_fidx].append({
+                            "bbox": [x1_i, y1_i, x2_i, y2_i],
+                            "score": score,
+                            "mask": mask_arr,
+                            "obj_id": global_obj_id,
+                        })
+
+    return faces, sam3_masks_all
+
+
+def _compute_iou(box1, box2):
+    """Compute IOU between two boxes in xyxy format."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+    union_area = box1_area + box2_area - inter_area
+    if union_area <= 0:
+        return 0.0
+    return inter_area / union_area
+
+
+def inference_video_parallel(args, chunk_duration_sec=120.0, overlap_sec=5.0):
+    """
+    Parallel SAM3 face detection using temporal chunking.
+
+    Args:
+        args: Argument namespace with videoFilePath, pyworkPath, etc.
+        chunk_duration_sec: Duration of each chunk in seconds (default 120s = 2min)
+        overlap_sec: Overlap between chunks in seconds (default 5s)
+
+    Returns:
+        faces: List of detections per frame (same format as inference_video)
+    """
+    import torch.multiprocessing as mp
+
+    if not torch.cuda.is_available():
+        raise RuntimeError('SAM3 face detector backend requires a CUDA GPU')
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        raise RuntimeError('No CUDA GPUs available')
+
+    # Get SAM3 root path
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    sam3_root = os.path.abspath(os.path.join(this_dir, 'sam3-main'))
+    if not os.path.isdir(sam3_root):
+        raise RuntimeError(f'SAM3 root not found: {sam3_root}')
+
+    # Get video info
+    video_path = args.videoFilePath
+    duration, fps, total_frames = _get_video_info(video_path)
+    sys.stderr.write(f"Video info: duration={duration:.2f}s, fps={fps:.2f}, frames={total_frames}\n")
+
+    # Create chunks directory
+    chunks_dir = os.path.join(args.pyworkPath, 'sam3_chunks')
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    # Segment video
+    sys.stderr.write(f"Segmenting video into chunks of {chunk_duration_sec}s with {overlap_sec}s overlap...\n")
+    threads = int(getattr(args, 'nDataLoaderThread', 4))
+    chunks = _segment_video_for_parallel(
+        video_path, chunks_dir,
+        chunk_duration_sec=chunk_duration_sec,
+        overlap_sec=overlap_sec,
+        fps=fps,
+        threads=threads
+    )
+    sys.stderr.write(f"Created {len(chunks)} chunks\n")
+
+    # Prepare tasks with GPU assignment (round-robin across GPUs)
+    tasks = []
+    for i, (chunk_path, start_frame, end_frame, chunk_idx) in enumerate(chunks):
+        gpu_id = i % n_gpus  # Real GPU ID, not CUDA_VISIBLE_DEVICES
+        tasks.append((chunk_path, start_frame, end_frame, chunk_idx, gpu_id, sam3_root))
+
+    # Process chunks in parallel using spawn
+    # Each worker uses a different real GPU via gpus_to_use parameter
+    mp_ctx = mp.get_context('spawn')
+    n_workers = min(len(tasks), n_gpus)  # One worker per GPU max
+
+    sys.stderr.write(f"Processing {len(tasks)} chunks with {n_workers} parallel workers on {n_gpus} GPUs...\n")
+
+    with mp_ctx.Pool(processes=n_workers) as pool:
+        results = list(tqdm.tqdm(
+            pool.imap(_sam3_chunk_worker, tasks),
+            total=len(tasks),
+            desc="SAM3 parallel chunks"
+        ))
+
+    # Check for errors and debug output
+    for r in results:
+        chunk_idx = r.get('chunk_idx', '?')
+        if r.get('error'):
+            sys.stderr.write(f"Chunk {chunk_idx} ERROR: {r['error']}\n")
+        else:
+            frame_outputs = r.get('frame_outputs', {})
+            total_dets = sum(len(out.get('out_obj_ids', [])) for out in frame_outputs.values())
+            sys.stderr.write(f"Chunk {chunk_idx}: {len(frame_outputs)} frames, {total_dets} detections\n")
+
+    # Get resolution from first successful result
+    H, W = None, None
+    for r in results:
+        if r.get('H') and r.get('W'):
+            H, W = r['H'], r['W']
+            break
+    if H is None:
+        cap = cv2.VideoCapture(video_path)
+        if cap.isOpened():
+            ret, fr = cap.read()
+            if ret and fr is not None:
+                H, W = fr.shape[0], fr.shape[1]
+        cap.release()
+    if H is None:
+        raise RuntimeError("Could not determine video resolution")
+
+    # Merge results
+    overlap_frames = int(overlap_sec * fps)
+    sys.stderr.write(f"Merging results from {len(results)} chunks (overlap={overlap_frames} frames)...\n")
+
+    faces, sam3_masks_all = _merge_chunk_results(
+        results, overlap_frames, total_frames, H, W
+    )
+
+    # Save results
+    savePath = os.path.join(args.pyworkPath, "faces.pckl")
+    with open(savePath, "wb") as fil:
+        pickle.dump(faces, fil)
+    masksPath = os.path.join(args.pyworkPath, "sam3_masks.pckl")
+    with open(masksPath, "wb") as fil:
+        pickle.dump(sam3_masks_all, fil)
+
+    # Cleanup chunk files
+    try:
+        import shutil
+        shutil.rmtree(chunks_dir)
+    except Exception:
+        pass
+
+    sys.stderr.write(f"Parallel SAM3 processing complete: {sum(len(f) for f in faces)} detections\n")
+    return faces
+
+
+# ============================================================================
+# END TEMPORAL CHUNKING PARALLEL SAM3 PROCESSING
+# ============================================================================
+
 def scene_detect(args):
     # CPU: Scene detection, output is the list of each shot's time duration
     videoManager = VideoManager([args.videoFilePath])
@@ -296,163 +809,208 @@ def scene_detect(args):
     return sceneList
 
 def inference_video(args):
-    # GPU: Face detection from container video stream
-    if str(getattr(args, 'detBackend', 's3fd')).lower() == 's3fd':
-        # Legacy S3FD path (PyTorch)
-        DET = S3FD(device='cuda')
-        cap = cv2.VideoCapture(args.videoFilePath)
-        if not cap.isOpened():
-            raise RuntimeError(f"Failed to open video for detection: {args.videoFilePath}")
+    # GPU: Face detection from container video stream using SAM3 video segmentation only.
+    backend = str(getattr(args, 'detBackend', 'sam3')).lower()
+    if backend != 'sam3':
+        raise RuntimeError(f"inference_folder_sam3.py is SAM3-only; unsupported detBackend={backend!r}")
 
-        dets = []
-        fidx = 0
-        batch_imgs = []
-        batch_idx = []
-        B = max(1, int(args.facedetBatch))
+    # SAM3 text-grounded video segmentation using the official multi-GPU
+    # video predictor. This mirrors the sam3-main usage:
+    #   - start_session(resource_path=video_path)
+    #   - add_prompt(text="face", frame_index=0)
+    #   - propagate_in_video(...) to get per-frame masks.
+    if not torch.cuda.is_available():
+        raise RuntimeError('SAM3 face detector backend requires a CUDA GPU but none is available')
 
-        def flush_batch():
-            nonlocal batch_imgs, batch_idx, dets
-            if not batch_imgs:
-                return
-            batched_boxes = DET.detect_faces_batch(batch_imgs, conf_th=0.9, scales=[args.facedetScale])
-            for local_i, boxes in enumerate(batched_boxes):
-                fi = batch_idx[local_i]
-                frame_dets = []
-                for bbox in boxes:
-                    frame_dets.append({'frame': fi, 'bbox': (bbox[:-1]).tolist(), 'conf': float(bbox[-1])})
-                dets.append(frame_dets)
-                if fi % 50 == 0:
-                    sys.stderr.write('%s-%05d; %d dets\r' % (args.videoFilePath, fi, len(frame_dets)))
-            batch_imgs = []
-            batch_idx = []
+    # Resolve and insert local sam3-main into sys.path for imports
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    sam3_root = os.path.abspath(os.path.join(this_dir, 'sam3-main'))
+    if not os.path.isdir(sam3_root):
+        raise RuntimeError(f'SAM3 root directory not found at {sam3_root}; please ensure sam3-main is present')
+    if sam3_root not in sys.path:
+        sys.path.insert(0, sam3_root)
 
-        while True:
-            ret, image = cap.read()
-            if not ret:
-                break
-            imageNumpy = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            batch_imgs.append(imageNumpy)
-            batch_idx.append(fidx)
-            if len(batch_imgs) >= B:
-                flush_batch()
-            fidx += 1
-        cap.release()
-        flush_batch()
-        savePath = os.path.join(args.pyworkPath, 'faces.pckl')
-        with open(savePath, 'wb') as fil:
-            pickle.dump(dets, fil)
-        return dets
-
-    # Optimized SCRFD path with decord decode at reduced resolution
     try:
-        import decord  # type: ignore
-        import insightface  # type: ignore
-    except Exception as e:
-        raise RuntimeError('SCRFD detection requires decord and insightface. Please install them.') from e
+        from sam3.model_builder import build_sam3_video_predictor  # type: ignore
+    except Exception as e:  # pragma: no cover - environment/config errors
+        raise RuntimeError('Failed to import SAM3; ensure sam3-main is installable in this environment') from e
 
-    # Video properties for box scaling back to original resolution
+    # Build multi-GPU video predictor; enable async PyAV loader to avoid
+    # loading the entire video tensor into GPU memory at once.
+    # OPTIMIZED: Enable compilation, skip frames (3x), and use bfloat16 for speedup
+    # Note: image_size must stay at 1008 (ViT backbone has fixed RoPE position encodings)
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    gpus_to_use = list(range(n_gpus)) if n_gpus > 0 else None
+    predictor = build_sam3_video_predictor(
+        gpus_to_use=gpus_to_use,
+        async_loading_frames=True,
+        video_loader_type="pyav",
+        compile=False,  # Disabled: compile overhead too high with multi-GPU
+        image_size=1008,  # Must stay at 1008 (ViT RoPE is pre-computed for this size)
+        recondition_every_nth_frame=64,  # Run detector every 64 frames (4x less than default 16) - tracker handles in-between frames
+    )
+
+    # Start a new video session.
+    resp = predictor.handle_request(
+        {
+            "type": "start_session",
+            "resource_path": args.videoFilePath,
+        }
+    )
+    session_id = resp["session_id"]
+
+    # Add a global text prompt "face" anchored at frame 0.
+    predictor.handle_request(
+        {
+            "type": "add_prompt",
+            "session_id": session_id,
+            "frame_index": 0,
+            "text": "face",
+        }
+    )
+
+    # Collect per-frame outputs from propagate_in_video.
+    # Use bfloat16 autocast for faster inference (2x speedup on Ampere+ GPUs)
+    frame_outputs = {}
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for res in predictor.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": "forward",
+                "start_frame_index": 0,
+                "max_frame_num_to_track": None,
+            }
+        ):
+            fidx = int(res.get("frame_index", -1))
+            out = res.get("outputs", None)
+            if out is None or fidx < 0:
+                continue
+            frame_outputs[fidx] = out
+
+    # Close session and shut down workers to free GPU memory.
+    predictor.handle_request({"type": "close_session", "session_id": session_id})
     try:
-        W0, H0, _fps, _dur = _ffprobe_video_props(args.videoFilePath)
+        predictor.shutdown()
     except Exception:
+        pass
+
+    if not frame_outputs:
+        raise RuntimeError("SAM3 propagate_in_video produced no outputs")
+
+    # Determine total number of frames from outputs
+    max_fidx = max(frame_outputs.keys())
+    num_frames = max_fidx + 1
+
+    # Prepare per-frame detection/mask containers
+    faces = [[] for _ in range(num_frames)]
+    sam3_masks_all = [[] for _ in range(num_frames)]
+
+    # Determine video resolution from first non-empty mask or fallback to cv2
+    H = W = None
+    for out in frame_outputs.values():
+        masks = out.get("out_binary_masks", None)
+        if masks is None:
+            continue
+        masks_np = np.asarray(masks)
+        if masks_np.ndim == 3 and masks_np.shape[0] > 0:
+            H, W = int(masks_np.shape[1]), int(masks_np.shape[2])
+            break
+    if H is None or W is None:
         cap0 = cv2.VideoCapture(args.videoFilePath)
         if not cap0.isOpened():
-            raise RuntimeError(f"Failed to open video for detection: {args.videoFilePath}")
-        W0 = int(cap0.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        H0 = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            raise RuntimeError(f"Failed to open video to derive resolution: {args.videoFilePath}")
+        ret0, fr0 = cap0.read()
         cap0.release()
-        if W0 <= 0 or H0 <= 0:
-            raise RuntimeError('Unable to determine video resolution for scaling face boxes')
+        if not ret0 or fr0 is None:
+            raise RuntimeError("Failed to decode any frame to derive resolution")
+        H, W = fr0.shape[0], fr0.shape[1]
 
-    in_w = int(getattr(args, 'detInputW', 288)); in_h = int(getattr(args, 'detInputH', 160))
-    scale_x = float(W0) / float(in_w)
-    scale_y = float(H0) / float(in_h)
+    # Convert SAM3 outputs into whisperv faces.pckl + sam3_masks.pckl
+    for fidx in sorted(frame_outputs.keys()):
+        out = frame_outputs[fidx]
+        obj_ids = out.get("out_obj_ids", None)
+        probs = out.get("out_probs", None)
+        boxes_xywh = out.get("out_boxes_xywh", None)
+        masks = out.get("out_binary_masks", None)
+        if (
+            obj_ids is None
+            or probs is None
+            or boxes_xywh is None
+            or masks is None
+        ):
+            continue
 
-    # Build SCRFD detector (ONNXRuntime CUDA)
-    fa = insightface.app.FaceAnalysis(name='buffalo_sc', providers=['CUDAExecutionProvider'], provider_options=[{"device_id": 0}], allowed_modules=['detection'])
-    # FaceAnalysis has a .det_model with internal session and params; use it directly for speed
-    det = fa.det_model
-    det.prepare(ctx_id=0, input_size=(in_w, in_h))
-    det.use_kps = False
+        boxes_xywh_np = np.asarray(boxes_xywh, dtype=np.float32)
+        probs_np = np.asarray(probs, dtype=np.float32)
+        masks_np = np.asarray(masks, dtype=bool)
+        obj_ids_np = np.asarray(obj_ids, dtype=int)
 
-    # Precompute FPN anchor centers (copied from LiveCC FaceDetector)
-    import numpy as _np
-    fpn_centers = []
-    for stride in det._feat_stride_fpn:
-        ac = _np.stack(_np.mgrid[:in_h // stride, :in_w // stride][::-1], axis=-1).astype(_np.float32)
-        ac = (ac * stride).reshape((-1, 2))
-        ac = _np.stack([ac]*det._num_anchors, axis=1).reshape((-1, 2))
-        fpn_centers.append(torch.from_numpy(ac))
-    fpn_centers = torch.cat(fpn_centers)
+        if boxes_xywh_np.ndim != 2 or boxes_xywh_np.shape[1] != 4:
+            raise RuntimeError(f"SAM3 video: unexpected boxes_xywh shape {boxes_xywh_np.shape} at frame {fidx}")
+        if masks_np.shape[0] != boxes_xywh_np.shape[0]:
+            raise RuntimeError(f"SAM3 video: mask count mismatch with boxes at frame {fidx}")
+        if probs_np.shape[0] != boxes_xywh_np.shape[0]:
+            raise RuntimeError(f"SAM3 video: prob count mismatch with boxes at frame {fidx}")
 
-    # Decode frames via decord in manageable chunks
-    decord.bridge.set_bridge('torch')
-    rdr = decord.VideoReader(args.videoFilePath, width=in_w, height=in_h, num_threads=2)
-    n = len(rdr)
-    dets = []
+        # Convert normalized XYWH to pixel XYXY
+        xs = boxes_xywh_np[:, 0] * float(W)
+        ys = boxes_xywh_np[:, 1] * float(H)
+        ws = boxes_xywh_np[:, 2] * float(W)
+        hs = boxes_xywh_np[:, 3] * float(H)
+        x1 = xs
+        y1 = ys
+        x2 = xs + ws
+        y2 = ys + hs
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=-1)
 
-    # Detection helper on one frame tensor (C,H,W) uint8/float in [0..255]
-    def _detect_one(frame_chw: torch.Tensor):
-        # Normalize to NCHW float32 with mean/std matching SCRFD
-        fr = frame_chw.to(torch.float32)
-        fr = torch.stack([
-            (fr[0] - 127.5) / 128.0,
-            (fr[1] - 127.5) / 128.0,
-            (fr[2] - 127.5) / 128.0,
-        ], dim=0)
-        inp = fr.unsqueeze(0).numpy()  # NCHW float32
-        outs = det.session.run(det.output_names, {det.input_name: inp})
-        scores, distances = [], []
-        for i, stride in enumerate(det._feat_stride_fpn):
-            scores.append(outs[i])
-            distances.append(outs[i+det.fmc] * stride)
-        scores = torch.from_numpy(_np.vstack(scores)).flatten()
-        distances = torch.from_numpy(_np.vstack(distances))
-        keep = scores >= float(det.det_thresh)
-        if not torch.any(keep):
-            return None
-        scores = scores[keep]
-        distances = distances[keep]
-        boxes = torch.cat([fpn_centers[keep] - distances[:, :2], fpn_centers[keep] + distances[:, 2:]], dim=1)
-        # NMS
-        from torchvision.ops import nms as _nms
-        keep2 = _nms(boxes, scores, iou_threshold=float(det.nms_thresh))
-        boxes = boxes[keep2]
-        scores = scores[keep2]
-        if boxes.numel() == 0:
-            return None
-        # Scale back to original resolution
-        boxes = boxes.to(torch.float32)
-        boxes[:, [0,2]] = boxes[:, [0,2]] * scale_x
-        boxes[:, [1,3]] = boxes[:, [1,3]] * scale_y
-        bb = boxes.to(torch.int32).tolist()
-        sc = [float(s.item()) for s in scores]
-        out = []
-        for (x1,y1,x2,y2), s in zip(bb, sc):
-            out.append([x1,y1,x2,y2,s])
-        return out
+        frame_dets = []
+        frame_masks = []
+        for idx_det in range(boxes_xyxy.shape[0]):
+            b = boxes_xyxy[idx_det]
+            s = float(probs_np[idx_det])
+            bb = [int(round(v)) for v in b.tolist()]
+            x1_i, y1_i, x2_i, y2_i = bb
+            # Clamp to image bounds and ensure non-degenerate area
+            x1_i = max(0, min(x1_i, W - 1))
+            y1_i = max(0, min(y1_i, H - 1))
+            x2_i = max(0, min(x2_i, W))
+            y2_i = max(0, min(y2_i, H))
+            if x2_i <= x1_i or y2_i <= y1_i:
+                continue
 
-    CHUNK = 512
-    for start in range(0, n, CHUNK):
-        end = min(n, start + CHUNK)
-        idxs = list(range(start, end))
-        frames_bthwc = rdr.get_batch(idxs)  # (B,H,W,3) torch
-        frames_bchw = frames_bthwc.permute(0,3,1,2)  # (B,3,H,W)
-        for i in range(frames_bchw.shape[0]):
-            boxes = _detect_one(frames_bchw[i])
-            if boxes is None:
-                dets.append([])
-            else:
-                frame_dets = []
-                for b in boxes:
-                    frame_dets.append({'frame': start + i, 'bbox': [int(b[0]),int(b[1]),int(b[2]),int(b[3])], 'conf': float(b[4])})
-                dets.append(frame_dets)
-        if start % (CHUNK*2) == 0:
-            sys.stderr.write(f"{args.videoFilePath}-{start:05d}; chunk {start}-{end} processed\r")
+            frame_dets.append(
+                {
+                    "frame": int(fidx),
+                    "bbox": [x1_i, y1_i, x2_i, y2_i],
+                    "conf": s,
+                }
+            )
+            mask_arr = masks_np[idx_det]
+            if mask_arr.shape != (H, W):
+                raise RuntimeError(
+                    f"SAM3 video: mask shape {mask_arr.shape} does not match video frame {(H, W)}"
+                )
+            if mask_arr.any():
+                frame_masks.append(
+                    {
+                        "bbox": [x1_i, y1_i, x2_i, y2_i],
+                        "score": s,
+                        "mask": mask_arr,
+                        "obj_id": int(obj_ids_np[idx_det]),
+                    }
+                )
 
-    savePath = os.path.join(args.pyworkPath, 'faces.pckl')
-    with open(savePath, 'wb') as fil:
-        pickle.dump(dets, fil)
-    return dets
+        faces[int(fidx)] = frame_dets
+        sam3_masks_all[int(fidx)] = frame_masks
+
+    savePath = os.path.join(args.pyworkPath, "faces.pckl")
+    with open(savePath, "wb") as fil:
+        pickle.dump(faces, fil)
+    masksPath = os.path.join(args.pyworkPath, "sam3_masks.pckl")
+    with open(masksPath, "wb") as fil:
+        pickle.dump(sam3_masks_all, fil)
+    return faces
 
 def bb_intersection_over_union(boxA, boxB, evalCol = False):
     # CPU: IOU Function to calculate overlap between two image
@@ -533,12 +1091,12 @@ def crop_video(args, track, cropFile):
     audioStart  = (track['frame'][0]) / float(args.videoFps)
     audioEnd    = (track['frame'][-1]+1) / float(args.videoFps)
     vOut.release()
-    command = ("ffmpeg -y -i %s -c:a pcm_s16le -ac 1 -vn -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic" % \
-              (args.audioFilePath, args.nDataLoaderThread, audioStart, audioEnd, audioTmp))
+    command = ("%s -y -i %s -c:a pcm_s16le -ac 1 -vn -ar 16000 -threads %d -ss %.3f -to %.3f %s -loglevel panic" % \
+              (_FFMPEG_BIN, args.audioFilePath, args.nDataLoaderThread, audioStart, audioEnd, audioTmp))
     output = subprocess.call(command, shell=True, stdout=None) # Crop audio file
     _, audio = wavfile.read(audioTmp)
-    command = ("ffmpeg -y -i %st.avi -i %s -threads %d -c:v copy -c:a copy %s.avi -loglevel panic" % \
-              (cropFile, audioTmp, args.nDataLoaderThread, cropFile)) # Combine audio and video file
+    command = ("%s -y -i %st.avi -i %s -threads %d -c:v copy -c:a copy %s.avi -loglevel panic" % \
+              (_FFMPEG_BIN, cropFile, audioTmp, args.nDataLoaderThread, cropFile)) # Combine audio and video file
     output = subprocess.call(command, shell=True, stdout=None)
     os.remove(cropFile + 't.avi')
     return {'track':track, 'proc_track':dets, "cropFile":cropFile}
@@ -1295,15 +1853,15 @@ def _mux_worker(t):
         # Limit threads per ffmpeg when running in parallel to avoid oversubscription
         ff_threads = max(1, min(2, int(nThreads)))
         cmd1 = (
-            "ffmpeg -y -i %s -c:a pcm_s16le -ac 1 -vn -ar 16000 -threads %d -ss %.6f -to %.6f %s -loglevel panic"
-            % (audioPath, ff_threads, float(aStart), float(aEnd), audioTmp)
+            "%s -y -i %s -c:a pcm_s16le -ac 1 -vn -ar 16000 -threads %d -ss %.6f -to %.6f %s -loglevel panic"
+            % (_FFMPEG_BIN, audioPath, ff_threads, float(aStart), float(aEnd), audioTmp)
         )
         r1 = subprocess.call(cmd1, shell=True, stdout=None)
         if r1 != 0:
             return (tidx, False, f"audio cut failed rc={r1}")
         cmd2 = (
-            "ffmpeg -y -i %st.avi -i %s -threads %d -c:v copy -c:a copy %s.avi -loglevel panic"
-            % (cropFile, audioTmp, ff_threads, cropFile)
+            "%s -y -i %st.avi -i %s -threads %d -c:v copy -c:a copy %s.avi -loglevel panic"
+            % (_FFMPEG_BIN, cropFile, audioTmp, ff_threads, cropFile)
         )
         r2 = subprocess.call(cmd2, shell=True, stdout=None)
         if r2 != 0:
@@ -1520,9 +2078,26 @@ def visualization(tracks, scores, args):
         uniq = sorted(set(ids))
         colors = {}
         import colorsys, hashlib
+        base_h = {}
         for ident in uniq:
             hval = int(hashlib.md5(ident.encode('utf-8')).hexdigest()[:8], 16)
-            h = (hval % 360) / 360.0
+            base_h[ident] = float((hval % 360) / 360.0)
+        used = []
+        min_sep = 0.12
+        for ident in uniq:
+            h = base_h[ident]
+            for _ in range(6):
+                ok = True
+                for hu in used:
+                    d = abs(h - hu)
+                    d = min(d, 1.0 - d)
+                    if d < min_sep:
+                        h = (h + 0.5) % 1.0
+                        ok = False
+                        break
+                if ok:
+                    break
+            used.append(h)
             s = 0.65
             v = 0.95
             r, g, b = colorsys.hsv_to_rgb(h, s, v)
@@ -1776,8 +2351,8 @@ def visualization(tracks, scores, args):
         # Memory bank overlay removed: now shown in side panel
         vOut.write(image)
     vOut.release()
-    command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
-        (os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'), \
+    command = ("%s -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" % \
+        (_FFMPEG_BIN, os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'), \
         args.nDataLoaderThread, os.path.join(args.pyaviPath,'video_out.avi'))) 
     output = subprocess.call(command, shell=True, stdout=None)
 
@@ -3229,18 +3804,29 @@ def _id_color_map_global(tracks_list):
     ids = []
     for tr in tracks_list:
         ident = tr.get('identity', None)
+        # Treat only real Person_* identities; leave tracks with identity None
+        # out of the global color map so they won't appear in memory or panel.
         if isinstance(ident, str) and ident not in (None, 'None'):
             ids.append(_normalize_identity_prefix(ident))
     uniq = sorted(set(ids))
     colors = {}
-    import colorsys, hashlib
-    for ident in uniq:
-        hval = int(hashlib.md5(ident.encode('utf-8')).hexdigest()[:8], 16)
-        h = (hval % 360) / 360.0
-        s = 0.65
-        v = 0.95
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        colors[ident] = (int(r * 255), int(g * 255), int(b * 255))  # RGB tuple for Skia
+    # Use a fixed palette of moderately saturated, perceptually distinct RGB
+    # colors (Tableau-style), cycling when there are more identities than
+    # palette entries. This avoids both hue clustering和过高饱和度.
+    base_palette = [
+        (78, 121, 167),   # blue
+        (242, 142, 43),   # orange
+        (225, 87, 89),    # red
+        (118, 183, 178),  # teal
+        (89, 161, 79),    # green
+        (237, 201, 72),   # yellow
+        (176, 122, 161),  # purple
+        (255, 157, 167),  # pink
+    ]
+    n_palette = len(base_palette) or 1
+    for idx, ident in enumerate(uniq):
+        colors[ident] = base_palette[idx % n_palette]
+    # RGB tuples for Skia/panel
     return colors
 
 def _ffprobe_video_props(path):
@@ -3427,10 +4013,10 @@ def _render_panel_chunk_worker(args_pack):
 
     # ffmpeg pipe for chunk encoding (keep params identical across chunks)
     cmd = [
-        'ffmpeg','-y','-f','rawvideo','-pix_fmt','rgb24',
+        _FFMPEG_BIN,'-y','-f','rawvideo','-pix_fmt','rgb24',
         '-s', f'{panel_w}x{panel_h}','-r', f'{fps_eff}',
         '-i','-','-an','-c:v','libx264','-pix_fmt','yuv420p',
-        '-preset','veryfast','-crf','20', chunk_out,
+        '-crf','20', chunk_out,
         '-loglevel','error'
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -3652,11 +4238,22 @@ def _render_side_panel_skia_parallel(base_video_path: str,
 
     # Colors and memory identities
     id_colors = _id_color_map_global(tracks)
+    # Only keep identities that have actually spoken in diarization_results
+    spoken_idents = []
+    for seg in (diarization_results or []):
+        ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        spoken_idents.append(ident)
+    spoken_set = set(spoken_idents)
+
     mem_idents = []
     seen = set()
     for tr in tracks:
         ident = _normalize_identity_prefix(tr.get('identity'))
         if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        if ident not in spoken_set:
             continue
         if ident in seen:
             continue
@@ -3743,7 +4340,7 @@ def _render_side_panel_skia_parallel(base_video_path: str,
         for p in chunk_paths:
             f.write(f"file '{os.path.abspath(p)}'\n")
     cmd_concat = [
-        'ffmpeg','-y','-f','concat','-safe','0','-i', list_file,
+        _FFMPEG_BIN,'-y','-f','concat','-safe','0','-i', list_file,
         '-c','copy', output_panel_path,
         '-loglevel','error'
     ]
@@ -3929,12 +4526,24 @@ def render_side_panel_skia(base_video_path: str,
             out[ident] = rgb
         return out
 
-    # Memory identities: all unique non-None identities present in tracks
+    # Memory identities: only identities that have actually spoken (i.e., appear
+    # in diarization_results with a valid identity). This avoids showing silent
+    # faces in the memory grid and reduces color collisions.
+    spoken_idents = []
+    for seg in (diarization_results or []):
+        ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
+        if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        spoken_idents.append(ident)
+    spoken_set = set(spoken_idents)
+
     mem_idents = []
     seen = set()
     for tr in tracks:
         ident = _normalize_identity_prefix(tr.get('identity'))
         if not (isinstance(ident, str) and ident not in (None, 'None')):
+            continue
+        if ident not in spoken_set:
             continue
         if ident in seen:
             continue
@@ -3972,12 +4581,20 @@ def render_side_panel_skia(base_video_path: str,
     msgs.sort(key=lambda m: (m['start'], m['end']))
 
     # ffmpeg pipe for panel encoding
+    # Use a conservative H.264 encoding command that avoids newer options.
     cmd = [
-        'ffmpeg','-y','-f','rawvideo','-pix_fmt','rgb24',
-        '-s', f'{panel_w}x{panel_h}','-r', f'{fps_eff}',
-        '-i','-','-an','-c:v','libx264','-pix_fmt','yuv420p',
-        '-preset','veryfast','-crf','20', output_panel_path,
-        '-loglevel','error'
+        _FFMPEG_BIN, '-y',
+        '-f', 'rawvideo',
+        '-pix_fmt', 'rgb24',
+        '-s', f'{panel_w}x{panel_h}',
+        '-r', f'{fps_eff}',
+        '-i', '-',
+        '-an',
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-crf', '20',
+        output_panel_path,
+        '-loglevel', 'error',
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
@@ -4447,9 +5064,18 @@ def generate_ass_seq_wordtimed(diarization_results, output_ass_path, id_colors_m
 
 def visualization(tracks, scores, diarization_results, args, words_list=None):
     # Build per-frame overlays without using pyframes. This visualization is
-    # intentionally kept tied to the original S3FD/SCRFD + track/proc_track
-    # pipeline, and does NOT try to fuse in SAM3 detections. SAM3-based
-    # visualization should live in a separate inference_*_sam3 script.
+    # tied to the track/proc_track pipeline; when detBackend == 'sam3', it
+    # additionally uses SAM3 segmentation masks for overlays.
+    backend = str(getattr(args, 'detBackend', 'sam3')).lower()
+    use_sam3_masks = backend == 'sam3'
+    sam3_masks = None
+    if use_sam3_masks:
+        masks_path = os.path.join(args.pyworkPath, 'sam3_masks.pckl')
+        if not os.path.exists(masks_path):
+            raise RuntimeError(f"SAM3 masks file not found at {masks_path} while detBackend=='sam3'")
+        with open(masks_path, 'rb') as f:
+            sam3_masks = pickle.load(f)
+
     faces_by_frame = defaultdict(list)
     for tidx, track in enumerate(tracks):
         if tidx >= len(scores):
@@ -4492,27 +5118,35 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
         True,
     )
 
-    # Stable color map
-    def _id_color_map(tracks_list):
+    # Stable color map (per-identity) used for rectangles/masks in visualization.
+    # Use a fixed high-contrast palette and only assign colors to identities
+    # that have actually spoken, so speakers stay visually distinct.
+    def _id_color_map(tracks_list, spoken_set=None):
         ids = []
         for tr in tracks_list:
             ident = tr.get('identity', None)
             if ident is None or ident == 'None':
                 continue
+            if spoken_set is not None and ident not in spoken_set:
+                continue
             ids.append(ident)
         uniq = sorted(set(ids))
         colors = {}
-        import colorsys, hashlib
-        for ident in uniq:
-            hval = int(hashlib.md5(ident.encode('utf-8')).hexdigest()[:8], 16)
-            h = (hval % 360) / 360.0
-            s = 0.65
-            v = 0.95
-            r, g, b = colorsys.hsv_to_rgb(h, s, v)
-            colors[ident] = (int(b * 255), int(g * 255), int(r * 255))
+        # Tableau-like muted palette in BGR (to avoid overly saturated colors)
+        base_palette_bgr = [
+            (167, 121, 78),    # blue (BGR of 78,121,167)
+            (43, 142, 242),    # orange
+            (89, 87, 225),     # red
+            (178, 183, 118),   # teal
+            (79, 161, 89),     # green
+            (72, 201, 237),    # yellow
+            (161, 122, 176),   # purple
+            (167, 157, 255),   # pink
+        ]
+        n_palette = len(base_palette_bgr) or 1
+        for idx, ident in enumerate(uniq):
+            colors[ident] = base_palette_bgr[idx % n_palette]
         return colors
-
-    ID_COLORS = _id_color_map(tracks)
 
     # Speech bubble helpers (ensure defined in this visualization scope)
     segs_by_ident = defaultdict(list)
@@ -4650,6 +5284,15 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
         ident = _normalize_identity_prefix(seg.get('identity')) if isinstance(seg, dict) else None
         if isinstance(ident, str) and ident not in (None, 'None'):
             spoken_identities.add(ident)
+    # Color map: reuse global identity color map used by panel/memory to keep
+    # colors consistent across left video and right panel. Convert RGB->BGR for OpenCV.
+    id_colors_rgb = _id_color_map_global(tracks)
+    ID_COLORS = {}
+    for ident_norm, rgb in id_colors_rgb.items():
+        if spoken_identities and ident_norm not in spoken_identities:
+            continue
+        r, g, b = rgb
+        ID_COLORS[ident_norm] = (b, g, r)  # BGR
     # Build thumbnails only for spoken identities
     ID_THUMBS_ALL = _build_identity_thumbs(args.videoFilePath, tracks, scores)
     ID_THUMBS = {k: v for k, v in ID_THUMBS_ALL.items() if k in spoken_identities}
@@ -4663,26 +5306,82 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
         if not ret:
             break
         t_sec = float(fidx) / float(args.videoFps)
+        faces_frame = []
         for face in faces_by_frame.get(fidx, []):
-            ident = face['identity']
-            # Only visualize faces for identities that have spoken
-            if isinstance(ident, str) and ident not in spoken_identities:
+            ident_raw = face.get('identity', None)
+            if not isinstance(ident_raw, str) or ident_raw in (None, 'None'):
+                # Tracks without a resolved identity get no color/overlay
                 continue
-            color = ID_COLORS.get(ident, (200, 200, 200))
-            # Original visualization: square box centered at (x,y) with radius s
-            bbox_x = int(face['x'] - face['s'])
-            bbox_y = int(face['y'] - face['s'])
-            bbox_x = max(0, min(bbox_x, fw - 1))
-            bbox_y = max(0, min(bbox_y, fh - 1))
-            cv2.rectangle(
-                image,
-                (bbox_x, bbox_y),
-                (int(face['x'] + face['s']), int(face['y'] + face['s'])),
-                color,
-                5,
-            )
-            # Speech bubble disabled (rolled back by request)
-        # Memory tiles removed from main video; now shown in side panel
+            ident = _normalize_identity_prefix(ident_raw)
+            # Only visualize faces for identities that have spoken
+            if ident not in spoken_identities:
+                continue
+            faces_frame.append((ident, face))
+
+        # Draw face overlays: for SAM3 backend use segmentation mask *borders*; otherwise fall back to rectangles.
+        if faces_frame:
+            alpha = 0.45
+            if use_sam3_masks:
+                if sam3_masks is None or fidx >= len(sam3_masks):
+                    raise RuntimeError(f"SAM3 masks list shorter than video frames (frame {fidx})")
+                frame_masks = sam3_masks[fidx] or []
+                for ident, face in faces_frame:
+                    if ident not in ID_COLORS:
+                        raise RuntimeError(f"Missing color for identity {ident} in visualization map")
+                    color = ID_COLORS[ident]
+                    # Use SAM3 instance masks directly: choose the mask that
+                    # contains the track center (x, y). Among all masks that
+                    # include this center, prefer the one with highest score.
+                    cx = int(round(face['x']))
+                    cy = int(round(face['y']))
+                    if cx < 0 or cx >= fw or cy < 0 or cy >= fh:
+                        continue
+                    best = None
+                    best_score = float('-inf')
+                    for m in frame_masks:
+                        mask_arr = m.get('mask', None)
+                        if mask_arr is None:
+                            continue
+                        mask_bool = np.asarray(mask_arr, dtype=bool)
+                        if mask_bool.shape[0] != fh or mask_bool.shape[1] != fw:
+                            raise RuntimeError(
+                                f"SAM3 mask resolution {mask_bool.shape} does not match video frame {(fh, fw)}"
+                            )
+                        if not mask_bool[cy, cx]:
+                            continue
+                        s_val = float(m.get('score', 0.0))
+                        if s_val > best_score:
+                            best_score = s_val
+                            best = mask_bool
+                    if best is None:
+                        continue  # no mask covers the track center; skip to avoid fabricating shape
+                    # Only draw the *border* of the mask to avoid covering
+                    # interior pixels. Smooth edges by a light blur on the mask
+                    # before contour extraction.
+                    mask_u8 = (best.astype(np.uint8) * 255)
+                    mask_blur = cv2.GaussianBlur(mask_u8, (5, 5), 0)
+                    _, mask_bin = cv2.threshold(mask_blur, 128, 255, cv2.THRESH_BINARY)
+                    contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    for cnt in contours:
+                        if cnt is None or len(cnt) < 3:
+                            continue
+                        cv2.drawContours(image, [cnt], -1, color, thickness=2)
+            else:
+                overlay = image.copy()
+                for ident, face in faces_frame:
+                    if ident not in ID_COLORS:
+                        raise RuntimeError(f"Missing color for identity {ident} in visualization map")
+                    color = ID_COLORS[ident]
+                    x1 = int(face['x'] - face['s'])
+                    y1 = int(face['y'] - face['s'])
+                    x2 = int(face['x'] + face['s'])
+                    y2 = int(face['y'] + face['s'])
+                    x1 = max(0, min(x1, fw - 1))
+                    y1 = max(0, min(y1, fh - 1))
+                    x2 = max(x1 + 1, min(x2, fw))
+                    y2 = max(y1 + 1, min(y2, fh))
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness=-1)
+                cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, dst=image)
 
         vOut.write(image)
         fidx += 1
@@ -4691,9 +5390,11 @@ def visualization(tracks, scores, diarization_results, args, words_list=None):
 
     # Merge audio without generating subtitles (panel will carry text)
     video_with_audio_path = os.path.join(args.pyaviPath, 'video_out_with_audio.avi')
-    command = ("ffmpeg -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" %
-              (os.path.join(args.pyaviPath, 'video_only.avi'), os.path.join(args.pyaviPath, 'audio.wav'),
-                args.nDataLoaderThread, video_with_audio_path))
+    command = ("%s -y -i %s -i %s -threads %d -c:v copy -c:a copy %s -loglevel panic" %
+              (_FFMPEG_BIN,
+               os.path.join(args.pyaviPath, 'video_only.avi'),
+               os.path.join(args.pyaviPath, 'audio.wav'),
+               args.nDataLoaderThread, video_with_audio_path))
     subprocess.call(command, shell=True)
 
 def process_folder():
@@ -4760,7 +5461,7 @@ def process_video():
             if args.duration and float(args.duration) > 0:
                 ss_to = f" -ss {float(args.start):.3f} -to {float(args.start)+float(args.duration):.3f}"
             cmd = (
-                f"ffmpeg -y -i {args.videoPath}{ss_to} -c:a pcm_s16le -ac 1 -vn -threads {int(args.nDataLoaderThread)} -ar 16000 {args.audioFilePath} -loglevel panic"
+                f"{_FFMPEG_BIN} -y -i {args.videoPath}{ss_to} -c:a pcm_s16le -ac 1 -vn -threads {int(args.nDataLoaderThread)} -ar 16000 {args.audioFilePath} -loglevel panic"
             )
             subprocess.call(cmd, shell=True, stdout=None)
             if not os.path.exists(args.audioFilePath):
@@ -4853,7 +5554,14 @@ def process_video():
     faces_path = os.path.join(args.pyworkPath, 'faces.pckl')
     if (not os.path.exists(faces_path)) or force_rebuild:
         with tlog.timer('face_detect'):
-            faces = inference_video(args)
+            # Use parallel SAM3 processing if enabled (default)
+            if getattr(args, 'sam3Parallel', True):
+                chunk_sec = float(getattr(args, 'sam3ChunkSec', 120.0))
+                overlap_sec = float(getattr(args, 'sam3OverlapSec', 5.0))
+                sys.stderr.write(f"Using parallel SAM3 with chunk={chunk_sec}s, overlap={overlap_sec}s\n")
+                faces = inference_video_parallel(args, chunk_duration_sec=chunk_sec, overlap_sec=overlap_sec)
+            else:
+                faces = inference_video(args)
             sys.stderr.write(time.strftime("%Y-%m-%d %H:%M:%S") + " Face detection and save in %s \r\n" %(args.pyworkPath))
     else:
         with tlog.timer('face_load'):
@@ -5085,8 +5793,9 @@ def process_video():
                 ass_esc = ass_path.replace('\\', '\\\\')
                 fdir_esc = fonts_dir_abs.replace('\\', '\\\\')
                 cmd_sub = (
-                    f"ffmpeg -y -i {base_in} -vf \"subtitles='{ass_esc}':fontsdir='{fdir_esc}'\" "
-                    f"-c:v libx264 -crf 18 -preset veryfast -threads {int(args.nDataLoaderThread)} -c:a aac -b:a 192k -ar 16000 {base_sub} -loglevel error"
+                    f"{_FFMPEG_BIN} -y -i {base_in} -vf \"subtitles='{ass_esc}':fontsdir='{fdir_esc}'\" "
+                    f"-c:v libx264 -crf 18 -threads {int(args.nDataLoaderThread)} "
+                    f"-c:a aac -b:a 192k -ar 16000 {base_sub} -loglevel error"
                 )
                 rc0 = subprocess.call(cmd_sub, shell=True)
                 if rc0 != 0 or (not os.path.isfile(base_sub)):
@@ -5108,8 +5817,8 @@ def process_video():
         # hstack left(base) + right(panel)
         combined = os.path.join(args.pyaviPath, 'video_with_panel.mp4')
         cmd_combine = (
-            f"ffmpeg -y -i {base_in} -i {panel_out} -filter_complex \"[0:v][1:v]hstack=inputs=2[v]\" "
-            f"-map \"[v]\" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -threads {int(args.nDataLoaderThread)} "
+            f"{_FFMPEG_BIN} -y -i {base_in} -i {panel_out} -filter_complex \"[0:v][1:v]hstack=inputs=2[v]\" "
+            f"-map \"[v]\" -map 0:a? -c:v libx264 -crf 18 -threads {int(args.nDataLoaderThread)} "
             f"-c:a aac -b:a 192k -ar 16000 {combined} -loglevel error"
         )
         with tlog.timer('panel_compose'):
