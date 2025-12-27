@@ -1,4 +1,4 @@
-# WhisperV
+# WhisperVideo
 
 > **Visually-Grounded Speaker Transcription for Long-Form Multi-Speaker Videos**<br>
 > Agent Framework Integrating Visual Identity Tracking and Audio Transcription<br>
@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/586a758b-b04c-41a4-b31a-2d94e494c5f1
 
 Transcribing long-form, multi-speaker videos (e.g., talk shows) while correctly attributing speech to the corresponding on-screen speaker (i.e., visual-grounded) remains a significant challenge. It requires the coordination of multiple capabilities such as face detection, audio transcription, and cross-modality identity assignment.
 
-**WhisperV** is a novel agent framework that integrates specialized experts to achieve visually grounded speaker transcription for long videos.
+**WhisperVideo** is a novel agent framework that integrates specialized experts to achieve visually grounded speaker transcription for long videos.
 
 ### Three-Stage Pipeline:
 
@@ -216,4 +216,5 @@ whisperv/
 - **SAM3**: Segment Anything Model 3 for visual segmentation
 - **DeepFace**: Face recognition and verification
 - **Pyannote**: Speaker diarization toolkit
+
 
