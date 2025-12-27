@@ -5,6 +5,13 @@
 
 ---
 
+<a id="Demo"></a>
+## 🎬 Demo
+
+https://github.com/user-attachments/assets/586a758b-b04c-41a4-b31a-2d94e494c5f1
+
+---
+
 <a id="overview"></a>
 ## 📖 Overview
 
@@ -209,3 +216,4 @@ whisperv/
 - **SAM3**: Segment Anything Model 3 for visual segmentation
 - **DeepFace**: Face recognition and verification
 - **Pyannote**: Speaker diarization toolkit
+
