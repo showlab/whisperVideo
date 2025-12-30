@@ -1,7 +1,7 @@
 # WhisperVideo
 
 ## 📚 TL;DR
-Given a long multi-speaker video, **WhisperVideo** produces **(1) annotated video with identity labels / masks**, **(2) visually-grounded subtitles (SRT)**, and **(3) structured results (JSON / pickle)** by integrating **visual tracking + audio transcription + cross-modal matching**.
+Given a long multi-speaker video, **WhisperVideo** produces **(1) annotated video with identity labels / masks** and **(2) visually-grounded subtitles (SRT)** by integrating **visual tracking + audio transcription + cross-modal matching**.
 
 ---
 
@@ -216,6 +216,7 @@ whisperv/
 - **SAM3**: Segment Anything Model 3 for visual segmentation
 - **DeepFace**: Face recognition and verification
 - **Pyannote**: Speaker diarization toolkit
+
 
 
 
