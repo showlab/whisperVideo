@@ -1,4 +1,7 @@
-# WhisperVideo
+<p align="center">
+  <b>WhisperVideo</b>
+</p>
+
 
 <p align="center">
   <a href="https://scholar.google.com.sg/citations?user=y605TWYAAAAJ&hl=en">Siyuan Hu*</a>,
@@ -223,6 +226,7 @@ whisperv/
 - **SAM3**: Segment Anything Model 3 for visual segmentation
 - **DeepFace**: Face recognition and verification
 - **Pyannote**: Speaker diarization toolkit
+
 
 
 
