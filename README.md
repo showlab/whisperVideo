@@ -1,3 +1,5 @@
+# WhisperVideo
+
 <p align="center">
   <b>WhisperVideo</b>
 </p>
@@ -226,6 +228,7 @@ whisperv/
 - **SAM3**: Segment Anything Model 3 for visual segmentation
 - **DeepFace**: Face recognition and verification
 - **Pyannote**: Speaker diarization toolkit
+
 
 
 
