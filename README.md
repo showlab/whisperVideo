@@ -1,7 +1,7 @@
 # WhisperVideo
 
-> **Visually-Grounded Speaker Transcription for Long-Form Multi-Speaker Videos**<br>
-> Agent Framework Integrating Visual Identity Tracking and Audio Transcription<br>
+## 📚 TL;DR
+Given a long multi-speaker video, **WhisperVideo** produces **(1) annotated video with identity labels / masks**, **(2) visually-grounded subtitles (SRT)**, and **(3) structured results (JSON / pickle)** by integrating **visual tracking + audio transcription + cross-modal matching**.
 
 ---
 
@@ -216,5 +216,6 @@ whisperv/
 - **SAM3**: Segment Anything Model 3 for visual segmentation
 - **DeepFace**: Face recognition and verification
 - **Pyannote**: Speaker diarization toolkit
+
 
 
