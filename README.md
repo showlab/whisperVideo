@@ -223,11 +223,13 @@ whisperv/
 <a id="acknowledgements"></a>
 ## 🙏 Acknowledgements
 
-- **TalkNet**: Active speaker detection framework
-- **WhisperX**: Speech recognition and alignment
-- **SAM3**: Segment Anything Model 3 for visual segmentation
-- **DeepFace**: Face recognition and verification
-- **Pyannote**: Speaker diarization toolkit
+- [**TalkNet**](https://github.com/TaoRuijie/TalkNet-ASD): Active speaker detection framework
+- [**WhisperX**](https://github.com/m-bain/whisperX): Speech recognition and alignment
+- [**SAM3**](https://github.com/facebookresearch/sam3): Segment Anything Model 3 for visual segmentation
+- [**DeepFace**](https://github.com/serengil/deepface): Face recognition and verification
+- [**Pyannote**](https://github.com/pyannote/pyannote-audio): Speaker diarization toolkit
+
+
 
 
 
