@@ -72,38 +72,6 @@ It is built for real conversations, not short clips.
   </tr>
 </table>
 
-## 🔍 WhisperX vs WhisperVideo (Demo)
-
-<table>
-  <thead>
-    <tr>
-      <th align="left" style="width: 45%;">WhisperX (Plain Text)</th>
-      <th align="left" style="width: 55%;">WhisperVideo (Panel + Video)</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style="vertical-align: top;">
-        <pre>It's interesting.
-Okay.
-How bad is it?
-Let me put it this way.
-Do you own a barrel and suspenders?
-Are you serious?
-I'm not wearing this visor to play women's golf.
-Hi.
-Oh, let me guess.
-You guys are drafting your fantasy accounting firms.
-We're helping Raj.</pre>
-      </td>
-      <td style="vertical-align: top;">
-        <video src="demos/ttbb/ttbb.mp4" controls muted style="max-width: 100%; border-radius: 8px;"></video>
-        <div>If the video doesn't render, open <code>demos/ttbb/ttbb.mp4</code>.</div>
-      </td>
-    </tr>
-  </tbody>
-</table>
-
 ## 🧩 Install and Run
 
 ### 1. Create / use environment
