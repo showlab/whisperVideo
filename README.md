@@ -36,6 +36,24 @@
   </a>
 </h4>
 
+## 🖼️ Demo
+
+<table>
+  <tr>
+    <th align="center">Model</th>
+    <th align="center">Output Example</th>
+  </tr>
+  <tr>
+    <td align="center"><b>WhisperX</b><br/>Text-only transcript</td>
+    <td align="center"><img src="assets/whisperx_text.png" alt="WhisperX text-only example" style="width: 100%; max-width: 900px;" /></td>
+  </tr>
+  <tr>
+    <td align="center"><b>WhisperVideo (Ours)</b><br/>Visually grounded panel</td>
+    <td align="center"><img src="assets/whispervideo_ttbb.png" alt="WhisperVideo panel example" style="width: 100%; max-width: 900px;" /></td>
+  </tr>
+</table>
+
+
 ## 🎙️ Overview
 
 WhisperVideo is a clean demo for long-form, multi-speaker videos.
@@ -54,23 +72,6 @@ It is built for real conversations, not short clips.
 - [x] Long-video friendly
 - [x] Identity memory and clean speaker labels
 - [x] Panel view and subtitles for review
-
-## 🖼️ Demo
-
-<table>
-  <tr>
-    <th align="center">Model</th>
-    <th align="center">Output Example</th>
-  </tr>
-  <tr>
-    <td align="center"><b>WhisperX</b><br/>Text-only transcript</td>
-    <td align="center"><img src="assets/whisperx_text.png" alt="WhisperX text-only example" style="width: 100%; max-width: 900px;" /></td>
-  </tr>
-  <tr>
-    <td align="center"><b>WhisperVideo (Ours)</b><br/>Visually grounded panel</td>
-    <td align="center"><img src="assets/whispervideo_ttbb.png" alt="WhisperVideo panel example" style="width: 100%; max-width: 900px;" /></td>
-  </tr>
-</table>
 
 ## 🧩 Install and Run
 
