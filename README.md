@@ -40,16 +40,18 @@
 
 <table>
   <tr>
-    <th align="center">Model</th>
-    <th align="center">Output Example</th>
+    <th align="center">WhisperX</th>
+    <th align="center">WhisperVideo (Ours)</th>
   </tr>
   <tr>
-    <td align="center"><b>WhisperX</b><br/>Text-only transcript</td>
-    <td align="center"><img src="assets/whisperx_text.png" alt="WhisperX text-only example" style="width: 100%; max-width: 900px;" /></td>
-  </tr>
-  <tr>
-    <td align="center"><b>WhisperVideo (Ours)</b><br/>Visually grounded panel</td>
-    <td align="center"><img src="assets/whispervideo_ttbb.png" alt="WhisperVideo panel example" style="width: 100%; max-width: 900px;" /></td>
+    <td align="center">
+      <b>Text-only transcript</b><br/>
+      <img src="assets/whisperx_text.png" alt="WhisperX text-only example" style="width: 100%; max-width: 900px;" />
+    </td>
+    <td align="center">
+      <b>Visually grounded panel</b><br/>
+      <img src="assets/whispervideo_ttbb.png" alt="WhisperVideo panel example" style="width: 100%; max-width: 900px;" />
+    </td>
   </tr>
 </table>
 
