@@ -55,7 +55,7 @@ It is built for real conversations, not short clips.
 - [x] Identity memory and clean speaker labels
 - [x] Panel view and subtitles for review
 
-## 🖼️ Comparison
+## 🖼️ Demo
 
 <table>
   <tr>
