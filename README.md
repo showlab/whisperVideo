@@ -55,6 +55,55 @@ It is built for real conversations, not short clips.
 - [x] Identity memory and clean speaker labels
 - [x] Panel view and subtitles for review
 
+## 🖼️ Comparison
+
+<table>
+  <tr>
+    <th align="center">Model</th>
+    <th align="center">Output Example</th>
+  </tr>
+  <tr>
+    <td align="center"><b>WhisperX</b><br/>Text-only transcript</td>
+    <td align="center"><img src="assets/whisperx_text.png" alt="WhisperX text-only example" style="width: 100%; max-width: 900px;" /></td>
+  </tr>
+  <tr>
+    <td align="center"><b>WhisperVideo (Ours)</b><br/>Visually grounded panel</td>
+    <td align="center"><img src="assets/whispervideo_ttbb.png" alt="WhisperVideo panel example" style="width: 100%; max-width: 900px;" /></td>
+  </tr>
+</table>
+
+## 🔍 WhisperX vs WhisperVideo (Demo)
+
+<table>
+  <thead>
+    <tr>
+      <th align="left" style="width: 45%;">WhisperX (Plain Text)</th>
+      <th align="left" style="width: 55%;">WhisperVideo (Panel + Video)</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style="vertical-align: top;">
+        <pre>It's interesting.
+Okay.
+How bad is it?
+Let me put it this way.
+Do you own a barrel and suspenders?
+Are you serious?
+I'm not wearing this visor to play women's golf.
+Hi.
+Oh, let me guess.
+You guys are drafting your fantasy accounting firms.
+We're helping Raj.</pre>
+      </td>
+      <td style="vertical-align: top;">
+        <video src="demos/ttbb/ttbb.mp4" controls muted style="max-width: 100%; border-radius: 8px;"></video>
+        <div>If the video doesn't render, open <code>demos/ttbb/ttbb.mp4</code>.</div>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
 ## 🧩 Install and Run
 
 ### 1. Create / use environment
